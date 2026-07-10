@@ -1,0 +1,16 @@
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+managed_components/
+dependencies.lock
+.cache/
+*.bak
+
+# VS Code Espressif IDF
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+
+# Sistema
+Thumbs.db
+.DS_Store

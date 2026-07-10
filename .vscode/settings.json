@@ -1,0 +1,31 @@
+{
+  "idf.currentSetup": "C:\\esp\\v6.0.1\\esp-idf",
+  "idf.openOcdConfigs": [
+    "board/esp32p4-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32p4"
+  },
+  "idf.portWin": "COM4",
+
+  "C_Cpp.intelliSenseEngine": "disabled",
+  "C_Cpp.autocomplete": "disabled",
+  "C_Cpp.errorSquiggles": "disabled",
+
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\Renan\\Documents\\esp32p4\\build"
+  ],
+
+  "files.associations": {
+    "*.h": "c",
+    "esp_lcd_jd9365.h": "c",
+    "esp_lcd_gsl3680.h": "c",
+    "esp_lcd_touch.h": "c",
+    "esp_lvgl_port.h": "c",
+    "lvgl.h": "c"
+  },
+  "idf.flashType": "UART"
+}
