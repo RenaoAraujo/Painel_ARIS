@@ -6,7 +6,7 @@
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32p4"
   },
-  "idf.portWin": "COM4",
+  "idf.portWin": "COM3",
 
   "C_Cpp.intelliSenseEngine": "disabled",
   "C_Cpp.autocomplete": "disabled",

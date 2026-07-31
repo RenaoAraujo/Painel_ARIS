@@ -1,11 +1,13 @@
 /*
  * Dashboard LVGL - Guition JC1060P470C (ESP32-P4 7" 1024×600 MIPI-DSI).
- * UI: login -> dashboard com 3 abas (OS, Historico, Dispositivo).
+ * UI: splash -> login -> dashboard (OS, Historico) + tela Configuracoes.
  */
 
 #include "app_main.h"
 #include "esp_random.h"
 #include "freertos/queue.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <stdio.h>
 #include <string.h>
 #include <stddef.h>
@@ -106,6 +108,8 @@ typedef struct {
     lv_obj_t *ta_client;
     lv_obj_t *ta_total;
     lv_obj_t *ta_motivo;
+    lv_obj_t *btn_pause;
+    lv_obj_t *lbl_btn_pause;
 } os_widgets_t;
 
 static os_widgets_t s_os;
@@ -140,11 +144,15 @@ typedef struct {
 static dev_widgets_t s_dev;
 static uint32_t      s_dev_os_separadas    = 0;
 static uint32_t      s_dev_remed_separados = 0;
+/* Nome e código do robô em RAM (sincronizados com NVS e usados pelo gateway). */
+static char s_dev_robot_name[DEV_ROBOT_NAME_SZ] = "";
+static char s_dev_robot_code[DEV_ROBOT_ID_SZ]   = "";
 
 static void build_login_ui_into(lv_obj_t *scr);
 static void build_dashboard_into(lv_obj_t *scr);
 static void serial_cmd_timer_cb(lv_timer_t *t);
 static void os_show_concluida_modal(const char *num, uint32_t total);
+static void build_splash(void);
 static void historico_close_modal(void);
 static void historico_rebuild_list(void);
 static void historico_card_clicked(lv_event_t *e);
@@ -164,6 +172,50 @@ static void os_schedule_next_pick(void);
 static void serial_bridge_unit_deferred_cb(lv_timer_t *t);
 static void historico_push(const char *numero, const char *cliente, uint32_t separados, uint32_t total,
                            uint32_t duracao_ms, os_hist_estado_t estado, const char *motivo);
+static void build_settings_screen(lv_obj_t *dash_scr);
+static void os_btn_pausar_os_cb(lv_event_t *e);
+static void serial_bridge_os_pause(const char *num);
+static void serial_bridge_os_resume(const char *num);
+
+/* --------------------------------------------------------------------------
+ * NVS — persistência de nome e código do robô
+ * -------------------------------------------------------------------------- */
+#define NVS_NS        "aris_cfg"
+#define NVS_KEY_NAME  "robot_name"
+#define NVS_KEY_CODE  "robot_code"
+
+static void nvs_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+}
+
+static void nvs_load_device_config(char *name, size_t name_sz, char *code, size_t code_sz)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    nvs_get_str(h, NVS_KEY_NAME, name, &name_sz);
+    nvs_get_str(h, NVS_KEY_CODE, code, &code_sz);
+    nvs_close(h);
+}
+
+static void nvs_save_str(const char *key, const char *val)
+{
+    if (!key || !val) { return; }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    nvs_set_str(h, key, val);
+    nvs_commit(h);
+    nvs_close(h);
+    APP_INFO("NVS: '%s' = '%s'", key, val);
+}
 
 static void str_copy_trunc(char *dst, size_t cap, const char *src)
 {
@@ -238,16 +290,76 @@ static void format_duracao_ms(char *out, size_t cap, uint32_t ms)
     }
 }
 
-/* Paleta. */
-#define COLOR_BG          lv_color_hex(0xEEF2F7)
+/* Paleta baseada no logo A.R.I.S.
+ * Fundo: #EEEEF5 (lavanda muito claro)
+ * Accent: #7B7AB8 (roxo-lavanda médio — cor das letras do logo)
+ * Value: #1F1F60  (azul-marinho escuro — cor do subtítulo do logo)
+ */
+#define COLOR_BG          lv_color_hex(0xEEEEF5)
 #define COLOR_CARD        lv_color_hex(0xFFFFFF)
-#define COLOR_BORDER      lv_color_hex(0xE5E7EB)
-#define COLOR_LABEL       lv_color_hex(0x6B7280)
-#define COLOR_VALUE       lv_color_hex(0x111827)
-#define COLOR_ACCENT      lv_color_hex(0x2563EB)
-#define COLOR_ACCENT_DARK lv_color_hex(0x1E40AF)
+#define COLOR_BORDER      lv_color_hex(0xD4D4E8)
+#define COLOR_LABEL       lv_color_hex(0x6B6B9E)
+#define COLOR_VALUE       lv_color_hex(0x1F1F60)
+#define COLOR_ACCENT      lv_color_hex(0x7B7AB8)
+#define COLOR_ACCENT_DARK lv_color_hex(0x5A5A96)
 #define COLOR_OK          lv_color_hex(0x10B981)
-#define COLOR_BADGE_BG    lv_color_hex(0xE5E7EB)
+#define COLOR_BADGE_BG    lv_color_hex(0xE8E8F4)
+
+/* ====================================================================
+ * Splash screen — logo ARIS por 3 s antes do login.
+ * O binário logo_aris.bin (RGB565 1024×600) é embedado pelo CMake.
+ * ==================================================================== */
+extern const uint8_t logo_aris_bin_start[] asm("_binary_logo_aris_bin_start");
+extern const uint8_t logo_aris_bin_end[]   asm("_binary_logo_aris_bin_end");
+
+#define SPLASH_W  1024
+#define SPLASH_H  600
+#define SPLASH_MS 3000
+
+static lv_img_dsc_t s_splash_img_dsc;
+
+static void splash_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    /* Transição com fade para a tela de login. */
+    lv_obj_t *login_scr = lv_obj_create(NULL);
+    build_login_ui_into(login_scr);
+    lv_scr_load_anim(login_scr, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, true);
+}
+
+static void build_splash(void)
+{
+    if (!lvgl_port_lock(0)) {
+        APP_ERROR("Splash: falha no lock LVGL");
+        return;
+    }
+
+    /* Descritor da imagem apontando para o binário embedado. */
+    s_splash_img_dsc.header.always_zero = 0;
+    s_splash_img_dsc.header.w           = SPLASH_W;
+    s_splash_img_dsc.header.h           = SPLASH_H;
+    s_splash_img_dsc.header.cf          = LV_IMG_CF_TRUE_COLOR;
+    s_splash_img_dsc.data_size          = (uint32_t)(logo_aris_bin_end - logo_aris_bin_start);
+    s_splash_img_dsc.data               = logo_aris_bin_start;
+
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0xEEEEF5), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *img = lv_img_create(scr);
+    lv_img_set_src(img, &s_splash_img_dsc);
+    lv_obj_center(img);
+
+    lv_scr_load(scr);
+    lv_timer_t *t = lv_timer_create(splash_timer_cb, SPLASH_MS, NULL);
+    lv_timer_set_repeat_count(t, 1);
+
+    lvgl_port_unlock();
+    APP_INFO("Splash screen ativo (%d ms)", SPLASH_MS);
+}
+
+/* ================================================================= */
 
 /* Card branco com sombra suave, layout interno em coluna flex. */
 static lv_obj_t *make_card(lv_obj_t *parent)
@@ -259,7 +371,7 @@ static lv_obj_t *make_card(lv_obj_t *parent)
     lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(card, 18, LV_PART_MAIN);
     /* Sombra discreta: largura pequena evita area de redraw enorme em cada flush. */
-    lv_obj_set_style_shadow_color(card, lv_color_hex(0x9CA3AF), LV_PART_MAIN);
+    lv_obj_set_style_shadow_color(card, lv_color_hex(0x9090B8), LV_PART_MAIN);
     lv_obj_set_style_shadow_opa(card, LV_OPA_20, LV_PART_MAIN);
     lv_obj_set_style_shadow_width(card, 10, LV_PART_MAIN);
     lv_obj_set_style_shadow_ofs_y(card, 3, LV_PART_MAIN);
@@ -472,6 +584,16 @@ static void dev_ta_defocus_cb(lv_event_t *e)
         lv_keyboard_set_textarea(D->kb, NULL);
         lv_obj_add_flag(D->kb, LV_OBJ_FLAG_HIDDEN);
     }
+    lv_obj_t *ta = lv_event_get_target(e);
+    if (D && ta == D->ta_nome) {
+        const char *v = lv_textarea_get_text(ta);
+        str_copy_trunc(s_dev_robot_name, sizeof s_dev_robot_name, v);
+        nvs_save_str(NVS_KEY_NAME, v);
+    } else if (D && ta == D->ta_id) {
+        const char *v = lv_textarea_get_text(ta);
+        str_copy_trunc(s_dev_robot_code, sizeof s_dev_robot_code, v);
+        nvs_save_str(NVS_KEY_CODE, v);
+    }
 }
 
 static void dev_ta_activate_cb(lv_event_t *e)
@@ -650,6 +772,26 @@ static void ui_os_paint_labels(void)
             }
         }
     }
+
+    /* Botão pausar/retomar */
+    if (s_os.btn_pause && s_os.lbl_btn_pause) {
+        if (!s_os_active) {
+            lv_obj_add_flag(s_os.btn_pause, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(s_os.btn_pause, LV_OBJ_FLAG_HIDDEN);
+            if (s_os_paused) {
+                lv_label_set_text(s_os.lbl_btn_pause, "Retomar OS");
+                lv_obj_set_style_bg_color(s_os.btn_pause, lv_color_hex(0xD1FAE5), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(s_os.btn_pause, lv_color_hex(0xA7F3D0), LV_STATE_PRESSED);
+                lv_obj_set_style_text_color(s_os.lbl_btn_pause, lv_color_hex(0x065F46), LV_PART_MAIN);
+            } else {
+                lv_label_set_text(s_os.lbl_btn_pause, "Pausar OS");
+                lv_obj_set_style_bg_color(s_os.btn_pause, lv_color_hex(0xEDE8F8), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(s_os.btn_pause, lv_color_hex(0xD8D0F0), LV_STATE_PRESSED);
+                lv_obj_set_style_text_color(s_os.lbl_btn_pause, lv_color_hex(0x3D3B7A), LV_PART_MAIN);
+            }
+        }
+    }
 }
 
 static void dashboard_os_refresh(void)
@@ -776,11 +918,22 @@ static void style_tabview(lv_obj_t *tv)
     lv_obj_t *tab_bar = lv_tabview_get_tab_btns(tv);
     lv_obj_set_style_bg_color(tab_bar, COLOR_CARD, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(tab_bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_side(tab_bar, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+    lv_obj_set_style_border_color(tab_bar, COLOR_BORDER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(tab_bar, 1, LV_PART_MAIN);
+
+    /* Itens normais */
     lv_obj_set_style_text_font(tab_bar, &lv_font_montserrat_24, LV_PART_ITEMS);
     lv_obj_set_style_text_color(tab_bar, COLOR_LABEL, LV_PART_ITEMS);
-    lv_obj_set_style_bg_color(tab_bar, COLOR_ACCENT, LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_text_color(tab_bar, lv_color_white(), LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_radius(tab_bar, 12, LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(tab_bar, LV_OPA_TRANSP, LV_PART_ITEMS);
+    lv_obj_set_style_radius(tab_bar, 0, LV_PART_ITEMS);
+
+    /* Item selecionado: texto escuro + sublinhado na cor ARIS */
+    lv_obj_set_style_bg_opa(tab_bar, LV_OPA_TRANSP, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(tab_bar, COLOR_VALUE, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_border_side(tab_bar, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_border_color(tab_bar, COLOR_ACCENT, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_border_width(tab_bar, 3, LV_PART_ITEMS | LV_STATE_CHECKED);
 }
 
 static void historico_item_bubble_events(lv_obj_t *root)
@@ -914,18 +1067,32 @@ static void serial_bridge_os_cancel(const char *num, uint32_t done, const char *
 
 static void serial_bridge_pong(void)
 {
-    const char *raw_name = (s_dev.ta_nome && lv_textarea_get_text(s_dev.ta_nome)[0])
-                           ? lv_textarea_get_text(s_dev.ta_nome)
-                           : "Separador P4";
-    const char *raw_id   = (s_dev.ta_id && lv_textarea_get_text(s_dev.ta_id)[0])
-                           ? lv_textarea_get_text(s_dev.ta_id)
-                           : BRIDGE_ROBOT_CODE;
+    const char *raw_name = s_dev_robot_name[0] ? s_dev_robot_name : "Separador P4";
+    const char *raw_id   = s_dev_robot_code[0] ? s_dev_robot_code : BRIDGE_ROBOT_CODE;
     char en[DEV_ROBOT_NAME_SZ * 2];
     char eid[DEV_ROBOT_ID_SZ * 2];
     serial_bridge_escape(en,  sizeof en,  raw_name);
     serial_bridge_escape(eid, sizeof eid, raw_id);
     printf("BRIDGE:{\"ev\":\"pong\",\"robot\":\"%s\",\"name\":\"%s\"}\n", eid, en);
     APP_INFO("[BRIDGE pong] robot=%s name=%s", raw_id, raw_name);
+}
+
+static void serial_bridge_os_pause(const char *num)
+{
+    if (s_bridge_suppress) { return; }
+    char en[OS_NUM_BUF_SZ * 2];
+    serial_bridge_escape(en, sizeof en, num);
+    printf("BRIDGE:{\"ev\":\"os_pause\",\"num\":\"%s\"}\n", en);
+    APP_INFO("[BRIDGE os_pause] %s", num);
+}
+
+static void serial_bridge_os_resume(const char *num)
+{
+    if (s_bridge_suppress) { return; }
+    char en[OS_NUM_BUF_SZ * 2];
+    serial_bridge_escape(en, sizeof en, num);
+    printf("BRIDGE:{\"ev\":\"os_resume\",\"num\":\"%s\"}\n", en);
+    APP_INFO("[BRIDGE os_resume] %s", num);
 }
 
 /* ====================================================================
@@ -1046,11 +1213,19 @@ static void serial_cmd_timer_cb(lv_timer_t *t)
             serial_bridge_pong();
         } else if (cmd.type == CMD_SET_DEVICE) {
             APP_INFO("[CMD] set_device: name='%s' code='%s'", cmd.client, cmd.num);
-            if (s_dev.ta_nome && cmd.client[0]) {
-                lv_textarea_set_text(s_dev.ta_nome, cmd.client);
+            if (cmd.client[0]) {
+                str_copy_trunc(s_dev_robot_name, sizeof s_dev_robot_name, cmd.client);
+                nvs_save_str(NVS_KEY_NAME, s_dev_robot_name);
+                if (s_dev.ta_nome) {
+                    lv_textarea_set_text(s_dev.ta_nome, s_dev_robot_name);
+                }
             }
-            if (s_dev.ta_id && cmd.num[0]) {
-                lv_textarea_set_text(s_dev.ta_id, cmd.num);
+            if (cmd.num[0]) {
+                str_copy_trunc(s_dev_robot_code, sizeof s_dev_robot_code, cmd.num);
+                nvs_save_str(NVS_KEY_CODE, s_dev_robot_code);
+                if (s_dev.ta_id) {
+                    lv_textarea_set_text(s_dev.ta_id, s_dev_robot_code);
+                }
             }
         }
 
@@ -1292,6 +1467,7 @@ static void os_pause(void)
     s_os_paused = true;
     os_pick_timer_stop();
     ui_os_paint_labels();
+    serial_bridge_os_pause(s_os_num_str);
     APP_INFO("OS %s pausada", s_os_num_str);
 }
 
@@ -1305,6 +1481,7 @@ static void os_resume(void)
         os_schedule_next_pick();
     }
     ui_os_paint_labels();
+    serial_bridge_os_resume(s_os_num_str);
     APP_INFO("OS %s retomada", s_os_num_str);
 }
 
@@ -1747,6 +1924,278 @@ static void historico_card_clicked(lv_event_t *e)
     historico_open_detail(idx);
 }
 
+/* --------------------------------------------------------------------------
+ * Botão Pausar / Retomar OS
+ * -------------------------------------------------------------------------- */
+static void os_btn_pausar_os_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) { return; }
+    if (!s_os_active) { return; }
+    if (s_os_paused) {
+        os_resume();
+    } else {
+        os_pause();
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Tela de Configurações
+ * -------------------------------------------------------------------------- */
+static void settings_close_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) { return; }
+    lv_obj_t *modal = lv_event_get_user_data(e);
+    if (!modal) { return; }
+    /* Garante save NVS mesmo que defocus não tenha disparado. */
+    if (s_dev.ta_nome) {
+        const char *v = lv_textarea_get_text(s_dev.ta_nome);
+        str_copy_trunc(s_dev_robot_name, sizeof s_dev_robot_name, v);
+        nvs_save_str(NVS_KEY_NAME, v);
+    }
+    if (s_dev.ta_id) {
+        const char *v = lv_textarea_get_text(s_dev.ta_id);
+        str_copy_trunc(s_dev_robot_code, sizeof s_dev_robot_code, v);
+        nvs_save_str(NVS_KEY_CODE, v);
+    }
+    if (s_dev.kb) {
+        lv_keyboard_set_textarea(s_dev.kb, NULL);
+        lv_obj_add_flag(s_dev.kb, LV_OBJ_FLAG_HIDDEN);
+    }
+    s_dev.ta_nome       = NULL;
+    s_dev.ta_id         = NULL;
+    s_dev.lbl_os_cnt    = NULL;
+    s_dev.lbl_remed_cnt = NULL;
+    lv_obj_del(modal);
+}
+
+static void btn_open_settings_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) { return; }
+    lv_obj_t *dash_scr = lv_event_get_user_data(e);
+    build_settings_screen(dash_scr);
+}
+
+static void build_settings_screen(lv_obj_t *dash_scr)
+{
+    lv_obj_t *scr = lv_scr_act();
+
+    /* Fundo full-screen */
+    lv_obj_t *backdrop = lv_obj_create(scr);
+    lv_obj_remove_style_all(backdrop);
+    lv_obj_set_size(backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_align(backdrop, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(backdrop, COLOR_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(backdrop, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_flex_flow(backdrop, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(backdrop, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_all(backdrop, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(backdrop);
+
+    /* ── Cabeçalho ── */
+    lv_obj_t *hdr = lv_obj_create(backdrop);
+    lv_obj_remove_style_all(hdr);
+    lv_obj_set_width(hdr, lv_pct(100));
+    lv_obj_set_height(hdr, 64);
+    lv_obj_set_style_bg_color(hdr, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(hdr, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_side(hdr, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+    lv_obj_set_style_border_color(hdr, lv_color_hex(0xD4D4E8), LV_PART_MAIN);
+    lv_obj_set_style_border_width(hdr, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(hdr, 16, LV_PART_MAIN);
+    lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *btn_back = lv_btn_create(hdr);
+    lv_obj_set_size(btn_back, 130, 44);
+    lv_obj_set_style_radius(btn_back, 10, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn_back, COLOR_ACCENT, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn_back, settings_close_cb, LV_EVENT_CLICKED, backdrop);
+    lv_obj_t *lbl_back = lv_label_create(btn_back);
+    lv_label_set_text(lbl_back, "Voltar");
+    lv_obj_set_style_text_color(lbl_back, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl_back, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_center(lbl_back);
+
+    lv_obj_t *title = lv_label_create(hdr);
+    lv_label_set_text(title, "Configuracoes");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_42, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, COLOR_VALUE, LV_PART_MAIN);
+    lv_obj_set_flex_grow(title, 1);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+
+    /* Espaçador para equilibrar o título */
+    lv_obj_t *spacer = lv_obj_create(hdr);
+    lv_obj_remove_style_all(spacer);
+    lv_obj_set_size(spacer, 130, 44);
+
+    /* ── Corpo: sidebar + conteúdo ── */
+    lv_obj_t *body = lv_obj_create(backdrop);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(body, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Sidebar */
+    lv_obj_t *sidebar = lv_obj_create(body);
+    lv_obj_remove_style_all(sidebar);
+    lv_obj_set_size(sidebar, 210, lv_pct(100));
+    lv_obj_set_style_bg_color(sidebar, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sidebar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_side(sidebar, LV_BORDER_SIDE_RIGHT, LV_PART_MAIN);
+    lv_obj_set_style_border_color(sidebar, lv_color_hex(0xD4D4E8), LV_PART_MAIN);
+    lv_obj_set_style_border_width(sidebar, 1, LV_PART_MAIN);
+    lv_obj_set_flex_flow(sidebar, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(sidebar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_all(sidebar, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(sidebar, 6, LV_PART_MAIN);
+    lv_obj_clear_flag(sidebar, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Itens do menu (parte superior) */
+    lv_obj_t *menu_top = lv_obj_create(sidebar);
+    lv_obj_remove_style_all(menu_top);
+    lv_obj_set_width(menu_top, lv_pct(100));
+    lv_obj_set_height(menu_top, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(menu_top, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(menu_top, 4, LV_PART_MAIN);
+    lv_obj_clear_flag(menu_top, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Item: Dispositivo (selecionado) */
+    lv_obj_t *mi_dev = lv_obj_create(menu_top);
+    lv_obj_remove_style_all(mi_dev);
+    lv_obj_set_width(mi_dev, lv_pct(100));
+    lv_obj_set_height(mi_dev, 52);
+    lv_obj_set_style_bg_color(mi_dev, lv_color_hex(0xF0EEFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(mi_dev, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(mi_dev, 10, LV_PART_MAIN);
+    lv_obj_set_style_border_side(mi_dev, LV_BORDER_SIDE_LEFT, LV_PART_MAIN);
+    lv_obj_set_style_border_color(mi_dev, COLOR_ACCENT, LV_PART_MAIN);
+    lv_obj_set_style_border_width(mi_dev, 3, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(mi_dev, 14, LV_PART_MAIN);
+    lv_obj_set_flex_flow(mi_dev, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(mi_dev, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(mi_dev, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *lmi_dev = lv_label_create(mi_dev);
+    lv_label_set_text(lmi_dev, "Dispositivo");
+    lv_obj_set_style_text_font(lmi_dev, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lmi_dev, COLOR_ACCENT, LV_PART_MAIN);
+
+    /* Item: Sair (parte inferior do sidebar) */
+    lv_obj_t *mi_sair = lv_obj_create(sidebar);
+    lv_obj_remove_style_all(mi_sair);
+    lv_obj_set_width(mi_sair, lv_pct(100));
+    lv_obj_set_height(mi_sair, 52);
+    lv_obj_set_style_bg_color(mi_sair, lv_color_hex(0xFEE2E2), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(mi_sair, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(mi_sair, 10, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(mi_sair, lv_color_hex(0xFECACA), LV_STATE_PRESSED);
+    lv_obj_set_style_pad_left(mi_sair, 14, LV_PART_MAIN);
+    lv_obj_set_flex_flow(mi_sair, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(mi_sair, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(mi_sair, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(mi_sair, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(mi_sair, on_logout_clicked, LV_EVENT_CLICKED, dash_scr);
+    lv_obj_t *lmi_sair = lv_label_create(mi_sair);
+    lv_label_set_text(lmi_sair, "Sair");
+    lv_obj_set_style_text_font(lmi_sair, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lmi_sair, lv_color_hex(0xB91C1C), LV_PART_MAIN);
+
+    /* Área de conteúdo à direita */
+    lv_obj_t *content = lv_obj_create(body);
+    lv_obj_remove_style_all(content);
+    lv_obj_set_flex_grow(content, 1);
+    lv_obj_set_height(content, lv_pct(100));
+    lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_all(content, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(content, 12, LV_PART_MAIN);
+
+    /* Card: Identificação do Robô */
+    lv_obj_t *card_id = make_card(content);
+    lv_obj_set_width(card_id, lv_pct(100));
+    lv_obj_set_height(card_id, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_row(card_id, 8, LV_PART_MAIN);
+    make_card_label(card_id, "IDENTIFICACAO DO ROBO");
+
+    lv_obj_t *ln = lv_label_create(card_id);
+    lv_label_set_text(ln, "Nome do robo");
+    lv_obj_set_style_text_font(ln, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ln, COLOR_LABEL, LV_PART_MAIN);
+
+    s_dev.ta_nome = lv_textarea_create(card_id);
+    lv_textarea_set_one_line(s_dev.ta_nome, true);
+    lv_textarea_set_max_length(s_dev.ta_nome, DEV_ROBOT_NAME_SZ - 1);
+    lv_textarea_set_placeholder_text(s_dev.ta_nome, "ex.: Separador 01");
+    style_login_ta(s_dev.ta_nome);
+    lv_obj_set_width(s_dev.ta_nome, lv_pct(100));
+    lv_obj_set_style_min_height(s_dev.ta_nome, 52, LV_PART_MAIN);
+    lv_obj_add_event_cb(s_dev.ta_nome, dev_ta_activate_cb, LV_EVENT_FOCUSED, &s_dev);
+    lv_obj_add_event_cb(s_dev.ta_nome, dev_ta_activate_cb, LV_EVENT_CLICKED, &s_dev);
+    lv_obj_add_event_cb(s_dev.ta_nome, dev_ta_defocus_cb, LV_EVENT_DEFOCUSED, &s_dev);
+
+    lv_obj_t *lid = lv_label_create(card_id);
+    lv_label_set_text(lid, "Identificacao (ID)");
+    lv_obj_set_style_text_font(lid, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lid, COLOR_LABEL, LV_PART_MAIN);
+
+    s_dev.ta_id = lv_textarea_create(card_id);
+    lv_textarea_set_one_line(s_dev.ta_id, true);
+    lv_textarea_set_max_length(s_dev.ta_id, DEV_ROBOT_ID_SZ - 1);
+    lv_textarea_set_placeholder_text(s_dev.ta_id, "ex.: SN / inventario");
+    style_login_ta(s_dev.ta_id);
+    lv_obj_set_width(s_dev.ta_id, lv_pct(100));
+    lv_obj_set_style_min_height(s_dev.ta_id, 52, LV_PART_MAIN);
+    lv_obj_add_event_cb(s_dev.ta_id, dev_ta_activate_cb, LV_EVENT_FOCUSED, &s_dev);
+    lv_obj_add_event_cb(s_dev.ta_id, dev_ta_activate_cb, LV_EVENT_CLICKED, &s_dev);
+    lv_obj_add_event_cb(s_dev.ta_id, dev_ta_defocus_cb, LV_EVENT_DEFOCUSED, &s_dev);
+
+    /* Popula com os valores em RAM (já sincronizados com NVS). */
+    lv_textarea_set_text(s_dev.ta_nome, s_dev_robot_name[0] ? s_dev_robot_name : "Separador P4");
+    lv_textarea_set_text(s_dev.ta_id,   s_dev_robot_code[0] ? s_dev_robot_code : "ESP32-P4-001");
+
+    /* Card: Totais */
+    lv_obj_t *card_tot = make_card(content);
+    lv_obj_set_width(card_tot, lv_pct(100));
+    lv_obj_set_height(card_tot, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_row(card_tot, 8, LV_PART_MAIN);
+    make_card_label(card_tot, "TOTAIS (DESDE O ARRANQUE)");
+
+    lv_obj_t *lo = lv_label_create(card_tot);
+    lv_label_set_text(lo, "OS separadas");
+    lv_obj_set_style_text_font(lo, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lo, COLOR_LABEL, LV_PART_MAIN);
+
+    s_dev.lbl_os_cnt = lv_label_create(card_tot);
+    lv_label_set_text_fmt(s_dev.lbl_os_cnt, "%lu", (unsigned long)s_dev_os_separadas);
+    lv_obj_set_style_text_font(s_dev.lbl_os_cnt, &lv_font_montserrat_42, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_dev.lbl_os_cnt, COLOR_VALUE, LV_PART_MAIN);
+    lv_obj_set_width(s_dev.lbl_os_cnt, lv_pct(100));
+
+    lv_obj_t *lr = lv_label_create(card_tot);
+    lv_label_set_text(lr, "Remedios separados");
+    lv_obj_set_style_text_font(lr, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lr, COLOR_LABEL, LV_PART_MAIN);
+
+    s_dev.lbl_remed_cnt = lv_label_create(card_tot);
+    lv_label_set_text_fmt(s_dev.lbl_remed_cnt, "%lu", (unsigned long)s_dev_remed_separados);
+    lv_obj_set_style_text_font(s_dev.lbl_remed_cnt, &lv_font_montserrat_42, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_dev.lbl_remed_cnt, COLOR_VALUE, LV_PART_MAIN);
+    lv_obj_set_width(s_dev.lbl_remed_cnt, lv_pct(100));
+
+    lv_obj_update_layout(backdrop);
+    lv_obj_move_foreground(backdrop);
+    if (s_dev.kb) {
+        lv_obj_move_foreground(s_dev.kb);
+    }
+}
+
 static void build_dashboard_into(lv_obj_t *scr)
 {
     if (!scr) {
@@ -1785,23 +2234,23 @@ static void build_dashboard_into(lv_obj_t *scr)
     style_tabview(tv);
     lv_obj_add_event_cb(tv, dev_tabview_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    /* Sair: flutuante para nao roubar altura ao tabview. */
-    lv_obj_t *btn_logout = lv_btn_create(scr);
-    lv_obj_add_flag(btn_logout, LV_OBJ_FLAG_FLOATING);
-    lv_obj_set_size(btn_logout, 112, 44);
-    lv_obj_set_style_radius(btn_logout, 12, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(btn_logout, lv_color_hex(0xFEE2E2), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(btn_logout, lv_color_hex(0xFECACA), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(btn_logout, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(btn_logout, lv_color_hex(0xFCA5A5), LV_PART_MAIN);
-    lv_obj_add_event_cb(btn_logout, on_logout_clicked, LV_EVENT_CLICKED, scr);
-    lv_obj_align(btn_logout, LV_ALIGN_BOTTOM_RIGHT, -14, -14);
-    lv_obj_t *lbl_out = lv_label_create(btn_logout);
-    lv_label_set_text(lbl_out, "Sair");
-    lv_obj_set_style_text_color(lbl_out, lv_color_hex(0xB91C1C), LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_out, &lv_font_montserrat_24, LV_PART_MAIN);
-    lv_obj_center(lbl_out);
-    lv_obj_move_foreground(btn_logout);
+    /* Config: flutuante, canto inferior direito. */
+    lv_obj_t *btn_cfg = lv_btn_create(scr);
+    lv_obj_add_flag(btn_cfg, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_size(btn_cfg, 130, 44);
+    lv_obj_set_style_radius(btn_cfg, 12, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn_cfg, lv_color_hex(0xF0EEFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn_cfg, lv_color_hex(0xE0D8FF), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(btn_cfg, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(btn_cfg, lv_color_hex(0xB0A8E8), LV_PART_MAIN);
+    lv_obj_add_event_cb(btn_cfg, btn_open_settings_cb, LV_EVENT_CLICKED, scr);
+    lv_obj_align(btn_cfg, LV_ALIGN_BOTTOM_RIGHT, -14, -14);
+    lv_obj_t *lbl_cfg = lv_label_create(btn_cfg);
+    lv_label_set_text(lbl_cfg, "Config");
+    lv_obj_set_style_text_color(lbl_cfg, lv_color_hex(0x5048A8), LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl_cfg, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_center(lbl_cfg);
+    lv_obj_move_foreground(btn_cfg);
 
     /* Teclado em layer_top: nao redimensiona o tabview (evita crash no btnmatrix). */
     s_dev.kb = lv_keyboard_create(lv_layer_top());
@@ -1816,6 +2265,7 @@ static void build_dashboard_into(lv_obj_t *scr)
         lv_obj_t *t_os = lv_tabview_add_tab(tv, "OS");
         style_dashboard_tab_page(t_os);
         lv_obj_set_style_pad_all(t_os, 8, LV_PART_MAIN);
+        lv_obj_set_style_pad_bottom(t_os, 68, LV_PART_MAIN);
         lv_obj_set_style_pad_row(t_os, 8, LV_PART_MAIN);
 
         /* Sem OS ativa: ecra cheio com botao para criar OS manual. */
@@ -1941,8 +2391,32 @@ static void build_dashboard_into(lv_obj_t *scr)
         lv_label_set_long_mode(s_lbl_os_eta_detail, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(s_lbl_os_eta_detail, lv_pct(100));
 
-        lv_obj_t *b_cancel = lv_btn_create(s_os.panel_active);
-        lv_obj_set_width(b_cancel, lv_pct(100));
+        /* Linha com Pausar | Cancelar lado a lado */
+        lv_obj_t *btns_row = lv_obj_create(s_os.panel_active);
+        lv_obj_remove_style_all(btns_row);
+        lv_obj_set_width(btns_row, lv_pct(100));
+        lv_obj_set_height(btns_row, 56);
+        lv_obj_set_flex_flow(btns_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(btns_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(btns_row, 8, LV_PART_MAIN);
+        lv_obj_clear_flag(btns_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        s_os.btn_pause = lv_btn_create(btns_row);
+        lv_obj_set_flex_grow(s_os.btn_pause, 1);
+        lv_obj_set_height(s_os.btn_pause, 52);
+        lv_obj_set_style_radius(s_os.btn_pause, 12, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(s_os.btn_pause, lv_color_hex(0xEDE8F8), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(s_os.btn_pause, lv_color_hex(0xD8D0F0), LV_STATE_PRESSED);
+        lv_obj_add_event_cb(s_os.btn_pause, os_btn_pausar_os_cb, LV_EVENT_CLICKED, NULL);
+        s_os.lbl_btn_pause = lv_label_create(s_os.btn_pause);
+        lv_label_set_text(s_os.lbl_btn_pause, "Pausar OS");
+        lv_obj_set_style_text_font(s_os.lbl_btn_pause, &lv_font_montserrat_24, LV_PART_MAIN);
+        lv_obj_set_style_text_color(s_os.lbl_btn_pause, lv_color_hex(0x3D3B7A), LV_PART_MAIN);
+        lv_obj_center(s_os.lbl_btn_pause);
+        lv_obj_add_flag(s_os.btn_pause, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t *b_cancel = lv_btn_create(btns_row);
+        lv_obj_set_flex_grow(b_cancel, 1);
         lv_obj_set_height(b_cancel, 52);
         lv_obj_set_style_radius(b_cancel, 12, LV_PART_MAIN);
         lv_obj_set_style_bg_color(b_cancel, lv_color_hex(0xFEE2E2), LV_PART_MAIN);
@@ -1987,83 +2461,9 @@ static void build_dashboard_into(lv_obj_t *scr)
         historico_rebuild_list();
     }
 
-    /* ---------- Aba Dispositivo (identificacao + totais de producao) ---------- */
-    {
-        lv_obj_t *t_dev = lv_tabview_add_tab(tv, "Dispositivo");
-        style_dashboard_tab_page(t_dev);
-        lv_obj_set_style_pad_all(t_dev, 8, LV_PART_MAIN);
-        lv_obj_set_style_pad_row(t_dev, 10, LV_PART_MAIN);
-
-        lv_obj_t *card_id = make_card(t_dev);
-        lv_obj_set_width(card_id, lv_pct(100));
-        lv_obj_set_flex_grow(card_id, 1);
-        make_card_label(card_id, "IDENTIFICACAO DO ROBO");
-
-        lv_obj_t *ln = lv_label_create(card_id);
-        lv_label_set_text(ln, "Nome do robo");
-        lv_obj_set_style_text_font(ln, &lv_font_montserrat_24, LV_PART_MAIN);
-        lv_obj_set_style_text_color(ln, COLOR_LABEL, LV_PART_MAIN);
-
-        s_dev.ta_nome = lv_textarea_create(card_id);
-        lv_textarea_set_one_line(s_dev.ta_nome, true);
-        lv_textarea_set_max_length(s_dev.ta_nome, DEV_ROBOT_NAME_SZ - 1);
-        lv_textarea_set_placeholder_text(s_dev.ta_nome, "ex.: Separador 01");
-        style_login_ta(s_dev.ta_nome);
-        lv_obj_set_width(s_dev.ta_nome, lv_pct(100));
-        lv_obj_set_style_min_height(s_dev.ta_nome, 52, LV_PART_MAIN);
-        lv_textarea_set_text(s_dev.ta_nome, "Separador P4");
-        lv_obj_add_event_cb(s_dev.ta_nome, dev_ta_activate_cb, LV_EVENT_FOCUSED, &s_dev);
-        lv_obj_add_event_cb(s_dev.ta_nome, dev_ta_activate_cb, LV_EVENT_CLICKED, &s_dev);
-        lv_obj_add_event_cb(s_dev.ta_nome, dev_ta_defocus_cb, LV_EVENT_DEFOCUSED, &s_dev);
-
-        lv_obj_t *lid = lv_label_create(card_id);
-        lv_label_set_text(lid, "Identificacao (ID)");
-        lv_obj_set_style_text_font(lid, &lv_font_montserrat_24, LV_PART_MAIN);
-        lv_obj_set_style_text_color(lid, COLOR_LABEL, LV_PART_MAIN);
-
-        s_dev.ta_id = lv_textarea_create(card_id);
-        lv_textarea_set_one_line(s_dev.ta_id, true);
-        lv_textarea_set_max_length(s_dev.ta_id, DEV_ROBOT_ID_SZ - 1);
-        lv_textarea_set_placeholder_text(s_dev.ta_id, "ex.: SN / inventario");
-        style_login_ta(s_dev.ta_id);
-        lv_obj_set_width(s_dev.ta_id, lv_pct(100));
-        lv_obj_set_style_min_height(s_dev.ta_id, 52, LV_PART_MAIN);
-        lv_textarea_set_text(s_dev.ta_id, "ESP32-P4-001");
-        lv_obj_add_event_cb(s_dev.ta_id, dev_ta_activate_cb, LV_EVENT_FOCUSED, &s_dev);
-        lv_obj_add_event_cb(s_dev.ta_id, dev_ta_activate_cb, LV_EVENT_CLICKED, &s_dev);
-        lv_obj_add_event_cb(s_dev.ta_id, dev_ta_defocus_cb, LV_EVENT_DEFOCUSED, &s_dev);
-
-        lv_obj_t *card_tot = make_card(t_dev);
-        lv_obj_set_width(card_tot, lv_pct(100));
-        lv_obj_set_flex_grow(card_tot, 1);
-        make_card_label(card_tot, "TOTAIS (DESDE O ARRANQUE)");
-
-        lv_obj_t *lo = lv_label_create(card_tot);
-        lv_label_set_text(lo, "OS separadas");
-        lv_obj_set_style_text_font(lo, &lv_font_montserrat_24, LV_PART_MAIN);
-        lv_obj_set_style_text_color(lo, COLOR_LABEL, LV_PART_MAIN);
-
-        s_dev.lbl_os_cnt = lv_label_create(card_tot);
-        lv_label_set_text_fmt(s_dev.lbl_os_cnt, "%lu", (unsigned long)s_dev_os_separadas);
-        lv_obj_set_style_text_font(s_dev.lbl_os_cnt, &lv_font_montserrat_42, LV_PART_MAIN);
-        lv_obj_set_style_text_color(s_dev.lbl_os_cnt, COLOR_VALUE, LV_PART_MAIN);
-        lv_obj_set_width(s_dev.lbl_os_cnt, lv_pct(100));
-
-        lv_obj_t *lr = lv_label_create(card_tot);
-        lv_label_set_text(lr, "Remedios separados");
-        lv_obj_set_style_text_font(lr, &lv_font_montserrat_24, LV_PART_MAIN);
-        lv_obj_set_style_text_color(lr, COLOR_LABEL, LV_PART_MAIN);
-
-        s_dev.lbl_remed_cnt = lv_label_create(card_tot);
-        lv_label_set_text_fmt(s_dev.lbl_remed_cnt, "%lu", (unsigned long)s_dev_remed_separados);
-        lv_obj_set_style_text_font(s_dev.lbl_remed_cnt, &lv_font_montserrat_42, LV_PART_MAIN);
-        lv_obj_set_style_text_color(s_dev.lbl_remed_cnt, COLOR_VALUE, LV_PART_MAIN);
-        lv_obj_set_width(s_dev.lbl_remed_cnt, lv_pct(100));
-    }
-
     /* Sincroniza abas apos construir tudo (evita indice invalido no btnmatrix). */
     lv_tabview_set_act(tv, 0, LV_ANIM_OFF);
-    lv_obj_move_foreground(btn_logout);
+    lv_obj_move_foreground(btn_cfg);
 
     if (s_dash_timer) {
         lv_timer_del(s_dash_timer);
@@ -2211,7 +2611,7 @@ static void build_login_ui(void)
 
 static void build_ui(void)
 {
-    build_login_ui();
+    build_splash();
 }
 
 void ui_os_set_ordem(const char *numero_os, const char *nome_cliente)
@@ -2310,6 +2710,15 @@ static void fail_loop(const char *who, esp_err_t err)
 static void system_init(void)
 {
     esp_err_t err;
+
+    /* 0. NVS flash — persistência de configurações. */
+    nvs_init();
+    /* Carrega nome/código do robô na RAM para uso imediato. */
+    strncpy(s_dev_robot_name, "Separador P4", sizeof(s_dev_robot_name) - 1);
+    strncpy(s_dev_robot_code, "ESP32-P4-001", sizeof(s_dev_robot_code) - 1);
+    nvs_load_device_config(s_dev_robot_name, sizeof s_dev_robot_name,
+                           s_dev_robot_code, sizeof s_dev_robot_code);
+    APP_INFO("NVS ok — nome='%s' codigo='%s'", s_dev_robot_name, s_dev_robot_code);
 
     /* 1. LDOs internos: alimentam o transmissor MIPI-DSI do P4. */
     esp_ldo_channel_config_t ldo3_cfg = { .chan_id = 3, .voltage_mv = 2500 };
