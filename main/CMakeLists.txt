@@ -12,6 +12,7 @@ idf_component_register(
         esp_hw_support
         esp_app_format
         nvs_flash
+        driver
         lvgl
         esp_lvgl_port
 )

@@ -1,6 +1,6 @@
 /*
  * Dashboard LVGL - Guition JC1060P470C (ESP32-P4 7" 1024×600 MIPI-DSI).
- * UI: splash -> login -> dashboard (OS, Historico) + tela Configuracoes.
+ * UI: splash -> login -> dashboard (OS, Motor, Historico) + tela Configuracoes.
  */
 
 #include "app_main.h"
@@ -8,10 +8,17 @@
 #include "freertos/queue.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "driver/gpio.h"
 #include <stdio.h>
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
+
+/* ---------- GPIOs dos relés ---------- */
+#define LED_AMARELO_GPIO   GPIO_NUM_1   /* acende durante OS ativa        */
+#define LED_VERMELHO_GPIO  GPIO_NUM_2   /* pisca em pausa ou cancelamento  */
+#define STEPPER_STEP_GPIO  GPIO_NUM_20  /* pulso STEP do motor de passo   */
+#define STEPPER_DIR_GPIO   GPIO_NUM_32  /* direção DIR do motor de passo  */
 
 #ifndef LOGIN_DEMO_USER
 #define LOGIN_DEMO_USER  "admin"
@@ -38,6 +45,18 @@ static lv_obj_t *s_lbl_os_meds        = NULL;
 static lv_obj_t *s_bar_os_meds        = NULL;
 static lv_obj_t *s_lbl_os_eta         = NULL;
 static lv_obj_t *s_lbl_os_eta_detail  = NULL;
+static lv_obj_t  *s_settings_dash_scr = NULL;
+
+typedef struct {
+    lv_obj_t *mi_dev;
+    lv_obj_t *lbl_dev;
+    lv_obj_t *mi_telas;
+    lv_obj_t *lbl_telas;
+    lv_obj_t *panel_dev;
+    lv_obj_t *panel_telas;
+} settings_nav_t;
+
+static settings_nav_t s_settings_nav;
 
 static char       s_os_num_str[OS_NUM_BUF_SZ]       = "";
 static char       s_os_client_str[OS_CLIENT_BUF_SZ] = "";
@@ -48,6 +67,16 @@ static uint32_t   s_os_pick_samples = 0;
 static uint64_t   s_os_sess_start_us = 0;
 static bool       s_os_active       = false;
 static lv_timer_t *s_os_pick_timer  = NULL;
+
+/* Sessao: true enquanto o utilizador esta autenticado (dashboard visivel).
+ * Ao sair (logout), a separacao da OS continua a correr em segundo plano. */
+static bool       s_logged_in       = false;
+
+/* Conclusao de OS ocorrida enquanto o utilizador estava fora (logout):
+ * guarda os dados para mostrar o modal quando voltar a entrar. */
+static bool       s_os_concl_pending = false;
+static char       s_os_concl_num[OS_NUM_BUF_SZ] = "";
+static uint32_t   s_os_concl_total  = 0;
 
 static lv_timer_t *s_dash_timer    = NULL;
 
@@ -176,13 +205,28 @@ static void build_settings_screen(lv_obj_t *dash_scr);
 static void os_btn_pausar_os_cb(lv_event_t *e);
 static void serial_bridge_os_pause(const char *num);
 static void serial_bridge_os_resume(const char *num);
+static void stepper_stop(void);
+static void stepper_close_modal(void);
 
 /* --------------------------------------------------------------------------
  * NVS — persistência de nome e código do robô
  * -------------------------------------------------------------------------- */
 #define NVS_NS        "aris_cfg"
-#define NVS_KEY_NAME  "robot_name"
-#define NVS_KEY_CODE  "robot_code"
+#define NVS_KEY_NAME      "robot_name"
+#define NVS_KEY_CODE      "robot_code"
+/* Motor de passo */
+#define NVS_KEY_STEP_RPM  "step_rpm"   /* uint16: velocidade em RPM          */
+#define NVS_KEY_STEP_SPR  "step_spr"   /* uint16: passos por revolução       */
+#define NVS_KEY_STEP_MSTP "step_mstp"  /* uint8 : índice microstepping       */
+
+/* Tabela de divisores de microstepping suportados pelo driver */
+static const uint8_t MICROSTEP_OPTIONS[] = {1, 2, 4, 8, 16, 32};
+#define MICROSTEP_COUNT  ((int)(sizeof(MICROSTEP_OPTIONS)/sizeof(MICROSTEP_OPTIONS[0])))
+
+/* Estado persistente do motor de passo */
+static uint16_t s_stepper_rpm       = 60;  /* RPM padrão                     */
+static uint16_t s_stepper_steps_rev = 200; /* passos/rev (motor 1.8°)        */
+static uint8_t  s_stepper_ms_idx    = 0;   /* índice em MICROSTEP_OPTIONS    */
 
 static void nvs_init(void)
 {
@@ -215,6 +259,54 @@ static void nvs_save_str(const char *key, const char *val)
     nvs_commit(h);
     nvs_close(h);
     APP_INFO("NVS: '%s' = '%s'", key, val);
+}
+
+static void nvs_save_u8(const char *key, uint8_t val)
+{
+    if (!key) { return; }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    nvs_set_u8(h, key, val);
+    nvs_commit(h);
+    nvs_close(h);
+    APP_INFO("NVS: '%s' = %u", key, (unsigned)val);
+}
+
+static uint8_t nvs_load_u8(const char *key, uint8_t def)
+{
+    if (!key) { return def; }
+    nvs_handle_t h;
+    uint8_t v = def;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return def;
+    }
+    nvs_get_u8(h, key, &v);
+    nvs_close(h);
+    return v;
+}
+
+static void nvs_save_u16(const char *key, uint16_t val)
+{
+    if (!key) { return; }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) { return; }
+    nvs_set_u16(h, key, val);
+    nvs_commit(h);
+    nvs_close(h);
+    APP_INFO("NVS: '%s' = %u", key, (unsigned)val);
+}
+
+static uint16_t nvs_load_u16(const char *key, uint16_t def)
+{
+    if (!key) { return def; }
+    nvs_handle_t h;
+    uint16_t v = def;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) { return def; }
+    nvs_get_u16(h, key, &v);
+    nvs_close(h);
+    return v;
 }
 
 static void str_copy_trunc(char *dst, size_t cap, const char *src)
@@ -649,6 +741,8 @@ static void on_login_btn_clicked(lv_event_t *e)
     }
     APP_INFO("Login OK");
 
+    s_logged_in = true;
+
     lv_obj_t *dash = lv_obj_create(NULL);
     build_dashboard_into(dash);
     lv_scr_load(dash);
@@ -671,9 +765,16 @@ static void on_logout_clicked(lv_event_t *e)
         return;
     }
 
+    /* Marca a sessao como encerrada. NAO paramos o timer de separacao:
+     * a OS continua a correr em segundo plano. Se estiver em pausa,
+     * permanece em pausa (o estado e mantido nas variaveis globais). */
+    s_logged_in = false;
+    s_settings_dash_scr = NULL;
+    memset(&s_settings_nav, 0, sizeof(s_settings_nav));
+
     historico_close_modal();
-    os_pick_timer_stop();
     os_close_modal();
+    stepper_close_modal();
     dev_kb_destroy();
 
     if (s_dash_timer) {
@@ -692,6 +793,10 @@ static void on_logout_clicked(lv_event_t *e)
     s_lbl_os_eta        = NULL;
     s_lbl_os_eta_detail = NULL;
     s_hist_scroll       = NULL;
+    /* Os widgets do dashboard serao destruidos com o ecra; anula os ponteiros
+     * para que os callbacks em segundo plano (ex.: os_update_panels via
+     * os_reset_idle) nao acedam a memoria ja libertada. */
+    memset(&s_os, 0, sizeof(s_os));
     memset(&s_dev, 0, sizeof(s_dev));
 
     lv_obj_t *login_scr = lv_obj_create(NULL);
@@ -985,6 +1090,605 @@ static void os_update_panels(void)
     }
 }
 
+/* ====================================================================
+ * Controle de LEDs via relé (GPIO 1 = amarelo, GPIO 2 = vermelho)
+ * ==================================================================== */
+static lv_timer_t *s_led_blink_timer = NULL;
+static bool        s_led_blink_state = false;
+
+/* Módulo de relé ativo em LOW: GPIO=0 aciona o relé, GPIO=1 libera. */
+#define RELAY_ON  0
+#define RELAY_OFF 1
+
+static void led_gpio_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << LED_AMARELO_GPIO) | (1ULL << LED_VERMELHO_GPIO) |
+                        (1ULL << STEPPER_STEP_GPIO) | (1ULL << STEPPER_DIR_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    gpio_set_level(LED_AMARELO_GPIO,  RELAY_OFF);
+    gpio_set_level(LED_VERMELHO_GPIO, RELAY_OFF);
+    gpio_set_level(STEPPER_STEP_GPIO, 0);
+    gpio_set_level(STEPPER_DIR_GPIO,  0);
+    APP_INFO("Relés GPIO ok (amarelo=%d, vermelho=%d, step=%d, dir=%d)",
+             LED_AMARELO_GPIO, LED_VERMELHO_GPIO,
+             STEPPER_STEP_GPIO, STEPPER_DIR_GPIO);
+}
+
+static void led_amarelo_set(bool on)
+{
+    gpio_set_level(LED_AMARELO_GPIO, on ? RELAY_ON : RELAY_OFF);
+}
+
+static void led_blink_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    s_led_blink_state = !s_led_blink_state;
+    gpio_set_level(LED_VERMELHO_GPIO, s_led_blink_state ? RELAY_ON : RELAY_OFF);
+}
+
+static void led_vermelho_blink_start(void)
+{
+    if (s_led_blink_timer) { return; }
+    s_led_blink_state = true;
+    gpio_set_level(LED_VERMELHO_GPIO, RELAY_ON);
+    s_led_blink_timer = lv_timer_create(led_blink_timer_cb, 500, NULL);
+}
+
+static void led_vermelho_blink_stop(void)
+{
+    if (s_led_blink_timer) {
+        lv_timer_del(s_led_blink_timer);
+        s_led_blink_timer = NULL;
+    }
+    s_led_blink_state = false;
+    gpio_set_level(LED_VERMELHO_GPIO, RELAY_OFF);
+}
+
+/* ====================================================================
+ * Teste do motor de passo (STEP = GPIO 20, DIR = GPIO 32)
+ * ==================================================================== */
+typedef enum {
+    STEPPER_CMD_STOP = 0,
+    STEPPER_CMD_CW   = 1,
+    STEPPER_CMD_CCW  = 2,
+} stepper_cmd_t;
+
+static volatile stepper_cmd_t s_stepper_cmd = STEPPER_CMD_STOP;
+static esp_timer_handle_t s_stepper_timer = NULL;
+static bool s_step_level = false;
+static lv_obj_t *s_stepper_modal    = NULL;
+static lv_obj_t *s_stepper_btn_cw   = NULL;
+static lv_obj_t *s_stepper_btn_ccw  = NULL;
+static lv_obj_t *s_lbl_stepper_run  = NULL;
+/* Widgets da seção de configuração (criados em stepper_open_cb) */
+static lv_obj_t *s_stepper_lbl_rpm  = NULL;  /* ex.: "60 RPM"          */
+static lv_obj_t *s_stepper_sld_rpm  = NULL;  /* slider 1..300          */
+static lv_obj_t *s_stepper_lbl_spr  = NULL;  /* ex.: "200 passos/rev"  */
+static lv_obj_t *s_stepper_lbl_ms   = NULL;  /* ex.: "1x"              */
+static lv_obj_t *s_stepper_lbl_info = NULL;  /* passos/s + pulso µs    */
+
+/* Calcula o semiperiodo em µs a partir das configs atuais.
+ * half_period_us = 500 000 / (RPM/60 * SPR * microstep)
+ *                = 30 000 000 / (RPM * SPR * microstep)               */
+static uint32_t stepper_calc_pulse_us(void)
+{
+    uint8_t  ms  = MICROSTEP_OPTIONS[s_stepper_ms_idx];
+    uint32_t sps = (uint32_t)s_stepper_rpm * s_stepper_steps_rev * ms / 60u;
+    if (sps == 0) { return 10000u; }
+    uint32_t half_us = 500000UL / sps;
+    if (half_us < 20u) { half_us = 20u; }   /* ≤ 25 000 passos/s máx  */
+    return half_us;
+}
+
+/* Atualiza o label de informação calculada */
+static void stepper_refresh_info(void)
+{
+    if (!s_stepper_lbl_info) { return; }
+    uint8_t  ms   = MICROSTEP_OPTIONS[s_stepper_ms_idx];
+    uint32_t sps  = (uint32_t)s_stepper_rpm * s_stepper_steps_rev * ms / 60u;
+    uint32_t pulse = stepper_calc_pulse_us();
+    lv_label_set_text_fmt(s_stepper_lbl_info,
+        "%lu passos/s  |  Pulso: %lu µs", (unsigned long)sps, (unsigned long)pulse);
+}
+
+static void stepper_timer_cb(void *arg)
+{
+    (void)arg;
+    if (s_stepper_cmd == STEPPER_CMD_STOP) {
+        if (s_step_level) {
+            gpio_set_level(STEPPER_STEP_GPIO, 0);
+            s_step_level = false;
+        }
+        return;
+    }
+    s_step_level = !s_step_level;
+    gpio_set_level(STEPPER_STEP_GPIO, s_step_level ? 1 : 0);
+}
+
+static void stepper_stop(void)
+{
+    s_stepper_cmd = STEPPER_CMD_STOP;
+    if (s_stepper_timer) {
+        esp_timer_stop(s_stepper_timer);
+    }
+    s_step_level = false;
+    gpio_set_level(STEPPER_STEP_GPIO, 0);
+}
+
+static void stepper_run(stepper_cmd_t cmd)
+{
+    if (cmd == STEPPER_CMD_STOP) {
+        stepper_stop();
+        return;
+    }
+    gpio_set_level(STEPPER_DIR_GPIO, (cmd == STEPPER_CMD_CW) ? 1 : 0);
+    s_stepper_cmd = cmd;
+    if (!s_stepper_timer) {
+        return;
+    }
+    /* Para completamente antes de iniciar (garante período limpo) */
+    esp_timer_stop(s_stepper_timer);
+    s_step_level = false;
+    gpio_set_level(STEPPER_STEP_GPIO, 0);
+    esp_timer_start_periodic(s_stepper_timer, stepper_calc_pulse_us());
+}
+
+static void stepper_init(void)
+{
+    const esp_timer_create_args_t args = {
+        .callback = &stepper_timer_cb,
+        .name     = "stepper",
+    };
+    if (esp_timer_create(&args, &s_stepper_timer) != ESP_OK) {
+        APP_ERROR("Falha ao criar timer do stepper");
+        s_stepper_timer = NULL;
+        return;
+    }
+    stepper_stop();
+    APP_INFO("Stepper timer ok (STEP=%d DIR=%d)", (int)STEPPER_STEP_GPIO, (int)STEPPER_DIR_GPIO);
+}
+
+static void stepper_style_dir_btn(lv_obj_t *btn, bool active)
+{
+    if (!btn) {
+        return;
+    }
+    if (active) {
+        lv_obj_set_style_bg_color(btn, COLOR_OK, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x059669), LV_STATE_PRESSED);
+        lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+        if (lbl) {
+            lv_obj_set_style_text_color(lbl, lv_color_white(), LV_PART_MAIN);
+        }
+    } else {
+        lv_obj_set_style_bg_color(btn, COLOR_BADGE_BG, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0xD8D8EC), LV_STATE_PRESSED);
+        lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+        if (lbl) {
+            lv_obj_set_style_text_color(lbl, COLOR_VALUE, LV_PART_MAIN);
+        }
+    }
+}
+
+static void stepper_ui_refresh(void)
+{
+    stepper_cmd_t cmd = s_stepper_cmd;
+    if (s_lbl_stepper_run) {
+        if (cmd == STEPPER_CMD_CW) {
+            lv_label_set_text(s_lbl_stepper_run, "A rodar no sentido horario");
+            lv_obj_set_style_text_color(s_lbl_stepper_run, COLOR_OK, LV_PART_MAIN);
+        } else if (cmd == STEPPER_CMD_CCW) {
+            lv_label_set_text(s_lbl_stepper_run, "A rodar no sentido anti-horario");
+            lv_obj_set_style_text_color(s_lbl_stepper_run, COLOR_OK, LV_PART_MAIN);
+        } else {
+            lv_label_set_text(s_lbl_stepper_run, "Parado — escolha um sentido");
+            lv_obj_set_style_text_color(s_lbl_stepper_run, COLOR_LABEL, LV_PART_MAIN);
+        }
+    }
+    stepper_style_dir_btn(s_stepper_btn_cw,  cmd == STEPPER_CMD_CW);
+    stepper_style_dir_btn(s_stepper_btn_ccw, cmd == STEPPER_CMD_CCW);
+}
+
+/* ---------- helpers de config do stepper ---------------------------------- */
+
+static void stepper_save_config(void)
+{
+    nvs_save_u16(NVS_KEY_STEP_RPM,  s_stepper_rpm);
+    nvs_save_u16(NVS_KEY_STEP_SPR,  s_stepper_steps_rev);
+    nvs_save_u8 (NVS_KEY_STEP_MSTP, s_stepper_ms_idx);
+}
+
+static void stepper_refresh_rpm_label(void)
+{
+    if (s_stepper_lbl_rpm) {
+        lv_label_set_text_fmt(s_stepper_lbl_rpm, "%u RPM", (unsigned)s_stepper_rpm);
+    }
+    if (s_stepper_sld_rpm) {
+        lv_slider_set_value(s_stepper_sld_rpm, (int32_t)s_stepper_rpm, LV_ANIM_OFF);
+    }
+}
+
+static void stepper_refresh_spr_label(void)
+{
+    if (s_stepper_lbl_spr) {
+        lv_label_set_text_fmt(s_stepper_lbl_spr, "%u", (unsigned)s_stepper_steps_rev);
+    }
+}
+
+static void stepper_refresh_ms_label(void)
+{
+    if (s_stepper_lbl_ms) {
+        lv_label_set_text_fmt(s_stepper_lbl_ms, "%ux", (unsigned)MICROSTEP_OPTIONS[s_stepper_ms_idx]);
+    }
+}
+
+/* Reaplica a velocidade ao timer se o motor estiver a correr */
+static void stepper_apply_config(void)
+{
+    stepper_refresh_rpm_label();
+    stepper_refresh_spr_label();
+    stepper_refresh_ms_label();
+    stepper_refresh_info();
+    stepper_save_config();
+    if (s_stepper_cmd != STEPPER_CMD_STOP && s_stepper_timer) {
+        /* esp_timer_restart troca o período de forma atômica sem parar o timer */
+        esp_err_t err = esp_timer_restart(s_stepper_timer, stepper_calc_pulse_us());
+        if (err != ESP_OK) {
+            /* fallback: para e reinicia */
+            esp_timer_stop(s_stepper_timer);
+            esp_timer_start_periodic(s_stepper_timer, stepper_calc_pulse_us());
+        }
+    }
+}
+
+/* Callback do slider de RPM */
+static void stepper_rpm_slider_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) { return; }
+    lv_obj_t *sld = lv_event_get_target(e);
+    int32_t v = lv_slider_get_value(sld);
+    if (v < 1)    { v = 1; }
+    if (v > 2000) { v = 2000; }
+    s_stepper_rpm = (uint16_t)v;
+    stepper_apply_config();
+}
+
+/* Callback dos botões +/- de passos por revolução */
+static void stepper_spr_btn_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) { return; }
+    int delta = (int)(intptr_t)lv_event_get_user_data(e);
+    /* Valores típicos por passo: 50 → 100 → 200 → 400 → 800 */
+    static const uint16_t SPR_PRESETS[] = {50, 100, 200, 400, 800, 1600};
+    static const int SPR_COUNT = (int)(sizeof(SPR_PRESETS)/sizeof(SPR_PRESETS[0]));
+    /* Encontra o preset mais próximo e avança */
+    int idx = 0;
+    int best_dist = 9999;
+    for (int i = 0; i < SPR_COUNT; i++) {
+        int d = (int)SPR_PRESETS[i] - (int)s_stepper_steps_rev;
+        if (d < 0) { d = -d; }
+        if (d < best_dist) { best_dist = d; idx = i; }
+    }
+    idx += delta;
+    if (idx < 0) { idx = 0; }
+    if (idx >= SPR_COUNT) { idx = SPR_COUNT - 1; }
+    s_stepper_steps_rev = SPR_PRESETS[idx];
+    stepper_apply_config();
+}
+
+/* Callback dos botões +/- de microstepping */
+static void stepper_ms_btn_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) { return; }
+    int delta = (int)(intptr_t)lv_event_get_user_data(e);
+    int idx = (int)s_stepper_ms_idx + delta;
+    if (idx < 0) { idx = 0; }
+    if (idx >= MICROSTEP_COUNT) { idx = MICROSTEP_COUNT - 1; }
+    s_stepper_ms_idx = (uint8_t)idx;
+    stepper_apply_config();
+}
+
+/* Cria um painel de parâmetro com label de título, valor central e botões +/- */
+static lv_obj_t *stepper_make_param_panel(lv_obj_t *parent, const char *title,
+                                           lv_obj_t **out_val_lbl,
+                                           lv_event_cb_t btn_cb)
+{
+    lv_obj_t *panel = lv_obj_create(parent);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0xF1F0F8), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(panel, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(panel, 10, LV_PART_MAIN);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(panel, 6, LV_PART_MAIN);
+    lv_obj_set_flex_grow(panel, 1);
+    lv_obj_set_height(panel, LV_SIZE_CONTENT);
+
+    lv_obj_t *lbl_title = lv_label_create(panel);
+    lv_label_set_text(lbl_title, title);
+    lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_title, COLOR_LABEL, LV_PART_MAIN);
+
+    lv_obj_t *row = lv_obj_create(panel);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 8, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *btn_minus = lv_btn_create(row);
+    lv_obj_set_size(btn_minus, 48, 48);
+    lv_obj_set_style_radius(btn_minus, 10, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn_minus, COLOR_ACCENT, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn_minus, btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)-1);
+    lv_obj_t *lm = lv_label_create(btn_minus);
+    lv_label_set_text(lm, "-");
+    lv_obj_set_style_text_font(lm, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lm, lv_color_white(), LV_PART_MAIN);
+    lv_obj_center(lm);
+
+    lv_obj_t *val = lv_label_create(row);
+    lv_obj_set_flex_grow(val, 1);
+    lv_obj_set_style_text_font(val, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(val, COLOR_VALUE, LV_PART_MAIN);
+    lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_label_set_text(val, "---");
+    if (out_val_lbl) { *out_val_lbl = val; }
+
+    lv_obj_t *btn_plus = lv_btn_create(row);
+    lv_obj_set_size(btn_plus, 48, 48);
+    lv_obj_set_style_radius(btn_plus, 10, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn_plus, COLOR_ACCENT, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn_plus, btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)+1);
+    lv_obj_t *lp = lv_label_create(btn_plus);
+    lv_label_set_text(lp, "+");
+    lv_obj_set_style_text_font(lp, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lp, lv_color_white(), LV_PART_MAIN);
+    lv_obj_center(lp);
+
+    return panel;
+}
+
+/* -------------------------------------------------------------------------- */
+
+static void stepper_close_modal(void)
+{
+    stepper_stop();
+    s_stepper_btn_cw   = NULL;
+    s_stepper_btn_ccw  = NULL;
+    s_lbl_stepper_run  = NULL;
+    s_stepper_lbl_rpm  = NULL;
+    s_stepper_sld_rpm  = NULL;
+    s_stepper_lbl_spr  = NULL;
+    s_stepper_lbl_ms   = NULL;
+    s_stepper_lbl_info = NULL;
+    if (s_stepper_modal) {
+        lv_obj_del(s_stepper_modal);
+        s_stepper_modal = NULL;
+    }
+}
+
+static void stepper_voltar_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    stepper_close_modal();
+}
+
+static void stepper_dir_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    stepper_cmd_t cmd = (stepper_cmd_t)(uintptr_t)lv_event_get_user_data(e);
+    if (s_stepper_cmd == cmd) {
+        stepper_stop();
+    } else {
+        stepper_run(cmd);
+        APP_INFO("Stepper %s (STEP=%d DIR=%d)",
+                 (cmd == STEPPER_CMD_CW) ? "horario" : "anti-horario",
+                 (int)STEPPER_STEP_GPIO, (int)STEPPER_DIR_GPIO);
+    }
+    stepper_ui_refresh();
+}
+
+static void stepper_parar_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    stepper_stop();
+    stepper_ui_refresh();
+    APP_INFO("Stepper parado");
+}
+
+static void stepper_open_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    stepper_close_modal();
+
+    lv_obj_t *backdrop = lv_obj_create(lv_layer_top());
+    s_stepper_modal = backdrop;
+    lv_obj_remove_style_all(backdrop);
+    lv_obj_set_size(backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(backdrop, COLOR_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(backdrop, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(backdrop, 16, LV_PART_MAIN);
+    lv_obj_set_flex_flow(backdrop, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(backdrop, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(backdrop, 12, LV_PART_MAIN);
+    lv_obj_clear_flag(backdrop, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_obj_create(backdrop);
+    lv_obj_remove_style_all(hdr);
+    lv_obj_set_width(hdr, lv_pct(100));
+    lv_obj_set_height(hdr, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(hdr, 12, LV_PART_MAIN);
+
+    lv_obj_t *b_back = lv_btn_create(hdr);
+    lv_obj_set_height(b_back, 48);
+    lv_obj_set_style_radius(b_back, 12, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b_back, COLOR_BADGE_BG, LV_PART_MAIN);
+    lv_obj_add_event_cb(b_back, stepper_voltar_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *l_back = lv_label_create(b_back);
+    lv_label_set_text(l_back, "Voltar");
+    lv_obj_set_style_text_font(l_back, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l_back, COLOR_VALUE, LV_PART_MAIN);
+    lv_obj_center(l_back);
+
+    lv_obj_t *tit = lv_label_create(hdr);
+    lv_label_set_text(tit, "Teste do motor de passo");
+    lv_obj_set_style_text_font(tit, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tit, COLOR_LABEL, LV_PART_MAIN);
+    lv_obj_set_flex_grow(tit, 1);
+
+    /* ---- Card de configuração -------------------------------------------- */
+    lv_obj_t *cfg_card = make_card(backdrop);
+    lv_obj_set_width(cfg_card, lv_pct(100));
+    lv_obj_set_height(cfg_card, LV_SIZE_CONTENT);
+
+    make_card_label(cfg_card, "CONFIGURAÇÃO");
+
+    /* Linha superior: RPM | Passos/Rev | Microstepping */
+    lv_obj_t *params_row = lv_obj_create(cfg_card);
+    lv_obj_remove_style_all(params_row);
+    lv_obj_set_width(params_row, lv_pct(100));
+    lv_obj_set_height(params_row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(params_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(params_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_column(params_row, 10, LV_PART_MAIN);
+    lv_obj_clear_flag(params_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* --- Painel RPM --- */
+    lv_obj_t *rpm_panel = lv_obj_create(params_row);
+    lv_obj_remove_style_all(rpm_panel);
+    lv_obj_set_style_bg_color(rpm_panel, lv_color_hex(0xF1F0F8), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(rpm_panel, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(rpm_panel, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(rpm_panel, 10, LV_PART_MAIN);
+    lv_obj_set_flex_grow(rpm_panel, 2);
+    lv_obj_set_height(rpm_panel, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(rpm_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(rpm_panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(rpm_panel, 6, LV_PART_MAIN);
+
+    lv_obj_t *lbl_rpm_title = lv_label_create(rpm_panel);
+    lv_label_set_text(lbl_rpm_title, "Velocidade");
+    lv_obj_set_style_text_font(lbl_rpm_title, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_rpm_title, COLOR_LABEL, LV_PART_MAIN);
+
+    s_stepper_lbl_rpm = lv_label_create(rpm_panel);
+    lv_obj_set_style_text_font(s_stepper_lbl_rpm, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_stepper_lbl_rpm, COLOR_VALUE, LV_PART_MAIN);
+
+    s_stepper_sld_rpm = lv_slider_create(rpm_panel);
+    lv_obj_set_width(s_stepper_sld_rpm, lv_pct(100));
+    lv_slider_set_range(s_stepper_sld_rpm, 1, 2000);
+    lv_slider_set_value(s_stepper_sld_rpm, (int32_t)s_stepper_rpm, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_stepper_sld_rpm, COLOR_ACCENT, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_stepper_sld_rpm, COLOR_ACCENT_DARK, LV_PART_KNOB);
+    lv_obj_add_event_cb(s_stepper_sld_rpm, stepper_rpm_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* --- Painel Passos/Rev --- */
+    stepper_make_param_panel(params_row, "Passos/Rev", &s_stepper_lbl_spr, stepper_spr_btn_cb);
+
+    /* --- Painel Microstepping --- */
+    stepper_make_param_panel(params_row, "Microstepping", &s_stepper_lbl_ms, stepper_ms_btn_cb);
+
+    /* Linha de info calculada */
+    s_stepper_lbl_info = lv_label_create(cfg_card);
+    lv_obj_set_style_text_font(s_stepper_lbl_info, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_stepper_lbl_info, COLOR_LABEL, LV_PART_MAIN);
+    lv_obj_set_width(s_stepper_lbl_info, lv_pct(100));
+    lv_obj_set_style_text_align(s_stepper_lbl_info, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+
+    /* Popula labels com valores atuais */
+    stepper_refresh_rpm_label();
+    stepper_refresh_spr_label();
+    stepper_refresh_ms_label();
+    stepper_refresh_info();
+
+    /* ---- Card de controlo ------------------------------------------------- */
+    lv_obj_t *card = make_card(backdrop);
+    lv_obj_set_width(card, lv_pct(100));
+    lv_obj_set_flex_grow(card, 1);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    make_card_label(card, "SENTIDO");
+    lv_obj_t *hint = lv_label_create(card);
+    lv_label_set_text(hint, "Toque num botao para rodar. Toque de novo para parar.");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hint, COLOR_LABEL, LV_PART_MAIN);
+
+    s_lbl_stepper_run = lv_label_create(card);
+    lv_obj_set_style_text_font(s_lbl_stepper_run, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_width(s_lbl_stepper_run, lv_pct(100));
+    lv_obj_set_style_text_align(s_lbl_stepper_run, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+
+    lv_obj_t *row = lv_obj_create(card);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, 80);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 16, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_stepper_btn_ccw = lv_btn_create(row);
+    lv_obj_set_flex_grow(s_stepper_btn_ccw, 1);
+    lv_obj_set_height(s_stepper_btn_ccw, 72);
+    lv_obj_set_style_radius(s_stepper_btn_ccw, 14, LV_PART_MAIN);
+    lv_obj_add_event_cb(s_stepper_btn_ccw, stepper_dir_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)STEPPER_CMD_CCW);
+    lv_obj_t *lccw = lv_label_create(s_stepper_btn_ccw);
+    lv_label_set_text(lccw, "Anti-horario");
+    lv_obj_set_style_text_font(lccw, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_center(lccw);
+
+    s_stepper_btn_cw = lv_btn_create(row);
+    lv_obj_set_flex_grow(s_stepper_btn_cw, 1);
+    lv_obj_set_height(s_stepper_btn_cw, 72);
+    lv_obj_set_style_radius(s_stepper_btn_cw, 14, LV_PART_MAIN);
+    lv_obj_add_event_cb(s_stepper_btn_cw, stepper_dir_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)STEPPER_CMD_CW);
+    lv_obj_t *lcw = lv_label_create(s_stepper_btn_cw);
+    lv_label_set_text(lcw, "Horario");
+    lv_obj_set_style_text_font(lcw, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_center(lcw);
+
+    lv_obj_t *b_stop = lv_btn_create(card);
+    lv_obj_set_width(b_stop, lv_pct(100));
+    lv_obj_set_height(b_stop, 56);
+    lv_obj_set_style_radius(b_stop, 14, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b_stop, lv_color_hex(0xFEE2E2), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b_stop, lv_color_hex(0xFECACA), LV_STATE_PRESSED);
+    lv_obj_add_event_cb(b_stop, stepper_parar_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lstop = lv_label_create(b_stop);
+    lv_label_set_text(lstop, "Parar");
+    lv_obj_set_style_text_font(lstop, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lstop, lv_color_hex(0xB91C1C), LV_PART_MAIN);
+    lv_obj_center(lstop);
+
+    stepper_ui_refresh();
+    lv_obj_move_foreground(backdrop);
+}
+
+/* ==================================================================== */
+
 static void os_reset_idle(void)
 {
     os_pick_timer_stop();
@@ -997,6 +1701,8 @@ static void os_reset_idle(void)
     s_os_pick_ms_sum      = 0;
     s_os_pick_samples     = 0;
     s_os_sess_start_us    = 0;
+    led_amarelo_set(false);
+    led_vermelho_blink_stop();
     os_update_panels();
     ui_os_paint_labels();
 }
@@ -1375,7 +2081,14 @@ static void os_finalize_concluida(void)
                    OS_HIST_CONCLUIDA, NULL);
     os_reset_idle();
     serial_bridge_os_complete(num_copy, done_snap);
-    os_show_concluida_modal(num_copy, done_snap);
+    if (s_logged_in) {
+        os_show_concluida_modal(num_copy, done_snap);
+    } else {
+        /* Concluida em segundo plano: guarda para mostrar ao voltar a entrar. */
+        s_os_concl_pending = true;
+        str_copy_trunc(s_os_concl_num, sizeof s_os_concl_num, num_copy);
+        s_os_concl_total = done_snap;
+    }
     APP_INFO("OS %s concluida", num_copy);
 }
 
@@ -1454,6 +2167,7 @@ static void os_start_manual(const char *numero, const char *cliente, uint32_t to
     s_os_active        = true;
     os_close_modal();
     s_os_paused = false;
+    led_amarelo_set(true);
     os_update_panels();
     ui_os_paint_labels();
     os_schedule_next_pick();
@@ -1467,6 +2181,7 @@ static void os_pause(void)
     s_os_paused = true;
     os_pick_timer_stop();
     ui_os_paint_labels();
+    led_vermelho_blink_start();
     serial_bridge_os_pause(s_os_num_str);
     APP_INFO("OS %s pausada", s_os_num_str);
 }
@@ -1475,6 +2190,7 @@ static void os_resume(void)
 {
     if (!s_os_active || !s_os_paused) { return; }
     s_os_paused = false;
+    led_vermelho_blink_stop();
     /* Se há um pick em voo aguardando o deferred, ele agendará o próximo pick
      * sozinho ao ser processado; caso contrário, agendamos aqui. */
     if (!s_bridge_unit_pending) {
@@ -1645,6 +2361,10 @@ static void os_cancel_voltar_cb(lv_event_t *e)
     }
     os_close_modal();
     if (s_os_active) {
+        /* Se a OS não estava pausada, para o blink vermelho. */
+        if (!s_os_paused) {
+            led_vermelho_blink_stop();
+        }
         os_schedule_next_pick();
     }
 }
@@ -1673,6 +2393,7 @@ static void os_btn_cancelar_os_cb(lv_event_t *e)
         return;
     }
     os_pick_timer_stop();
+    led_vermelho_blink_start();
     os_open_cancel_modal();
 }
 
@@ -1762,36 +2483,7 @@ static void historico_rebuild_list(void)
 
 static void historico_seed_demo_if_empty(void)
 {
-    if (s_os_hist_count > 0) {
-        return;
-    }
-    str_copy_trunc(s_os_hist[0].numero, sizeof s_os_hist[0].numero, "2025-01720");
-    str_copy_trunc(s_os_hist[0].cliente, sizeof s_os_hist[0].cliente, "Farmacia Sul");
-    s_os_hist[0].separados = 48;
-    s_os_hist[0].total     = 48;
-    s_os_hist[0].duracao_ms = 18U * 60U * 1000U + 40U * 1000U;
-    s_os_hist[0].estado     = OS_HIST_CONCLUIDA;
-    s_os_hist[0].motivo[0]  = '\0';
-
-    str_copy_trunc(s_os_hist[1].numero, sizeof s_os_hist[1].numero, "2025-01698");
-    str_copy_trunc(s_os_hist[1].cliente, sizeof s_os_hist[1].cliente, "Hospital Dia Norte");
-    s_os_hist[1].separados = 120;
-    s_os_hist[1].total     = 120;
-    s_os_hist[1].duracao_ms = 52U * 60U * 1000U + 15U * 1000U;
-    s_os_hist[1].estado     = OS_HIST_CONCLUIDA;
-    s_os_hist[1].motivo[0]  = '\0';
-
-    str_copy_trunc(s_os_hist[2].numero, sizeof s_os_hist[2].numero, "2025-01655");
-    str_copy_trunc(s_os_hist[2].cliente, sizeof s_os_hist[2].cliente, "Clinica Vida");
-    s_os_hist[2].separados = 12;
-    s_os_hist[2].total     = 30;
-    s_os_hist[2].duracao_ms = 6U * 60U * 1000U + 33U * 1000U;
-    s_os_hist[2].estado     = OS_HIST_CONCLUIDA;
-    s_os_hist[2].motivo[0]  = '\0';
-
-    s_os_hist_count = 3;
-    s_dev_os_separadas += 3;
-    s_dev_remed_separados += 48u + 120u + 12u;
+    /* Histórico inicia vazio — sem dados de demonstração. */
 }
 
 static void historico_btn_fechar_clicked(lv_event_t *e)
@@ -1941,6 +2633,109 @@ static void os_btn_pausar_os_cb(lv_event_t *e)
 /* --------------------------------------------------------------------------
  * Tela de Configurações
  * -------------------------------------------------------------------------- */
+static void settings_menu_item_set_active(lv_obj_t *item, lv_obj_t *lbl, bool active)
+{
+    if (!item) {
+        return;
+    }
+    if (active) {
+        lv_obj_set_style_bg_color(item, lv_color_hex(0xF0EEFF), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(item, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_side(item, LV_BORDER_SIDE_LEFT, LV_PART_MAIN);
+        lv_obj_set_style_border_color(item, COLOR_ACCENT, LV_PART_MAIN);
+        lv_obj_set_style_border_width(item, 3, LV_PART_MAIN);
+        if (lbl) {
+            lv_obj_set_style_text_color(lbl, COLOR_ACCENT, LV_PART_MAIN);
+        }
+    } else {
+        lv_obj_set_style_bg_opa(item, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(item, 0, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(item, lv_color_hex(0xF0EEFF), LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(item, LV_OPA_COVER, LV_STATE_PRESSED);
+        if (lbl) {
+            lv_obj_set_style_text_color(lbl, COLOR_VALUE, LV_PART_MAIN);
+        }
+    }
+}
+
+static lv_obj_t *make_settings_menu_item(lv_obj_t *parent, const char *text, lv_obj_t **out_lbl)
+{
+    lv_obj_t *item = lv_obj_create(parent);
+    lv_obj_remove_style_all(item);
+    lv_obj_set_width(item, lv_pct(100));
+    lv_obj_set_height(item, 52);
+    lv_obj_set_style_radius(item, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(item, 14, LV_PART_MAIN);
+    lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(item, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(item, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(item, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *lbl = lv_label_create(item);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl, COLOR_VALUE, LV_PART_MAIN);
+    if (out_lbl) {
+        *out_lbl = lbl;
+    }
+    return item;
+}
+
+static lv_obj_t *make_settings_content_panel(lv_obj_t *parent)
+{
+    lv_obj_t *panel = lv_obj_create(parent);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_width(panel, lv_pct(100));
+    lv_obj_set_flex_grow(panel, 1);
+    lv_obj_set_height(panel, lv_pct(100));
+    lv_obj_add_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(panel, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_all(panel, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(panel, 12, LV_PART_MAIN);
+    return panel;
+}
+
+static void settings_hide_kb(void)
+{
+    if (s_dev.kb) {
+        lv_keyboard_set_textarea(s_dev.kb, NULL);
+        lv_obj_add_flag(s_dev.kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void settings_nav_dev_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    settings_menu_item_set_active(s_settings_nav.mi_dev, s_settings_nav.lbl_dev, true);
+    settings_menu_item_set_active(s_settings_nav.mi_telas, s_settings_nav.lbl_telas, false);
+    if (s_settings_nav.panel_dev) {
+        lv_obj_clear_flag(s_settings_nav.panel_dev, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_settings_nav.panel_telas) {
+        lv_obj_add_flag(s_settings_nav.panel_telas, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void settings_nav_telas_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    settings_hide_kb();
+    settings_menu_item_set_active(s_settings_nav.mi_dev, s_settings_nav.lbl_dev, false);
+    settings_menu_item_set_active(s_settings_nav.mi_telas, s_settings_nav.lbl_telas, true);
+    if (s_settings_nav.panel_dev) {
+        lv_obj_add_flag(s_settings_nav.panel_dev, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_settings_nav.panel_telas) {
+        lv_obj_clear_flag(s_settings_nav.panel_telas, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void settings_close_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) { return; }
@@ -1965,6 +2760,8 @@ static void settings_close_cb(lv_event_t *e)
     s_dev.ta_id         = NULL;
     s_dev.lbl_os_cnt    = NULL;
     s_dev.lbl_remed_cnt = NULL;
+    s_settings_dash_scr = NULL;
+    memset(&s_settings_nav, 0, sizeof(s_settings_nav));
     lv_obj_del(modal);
 }
 
@@ -1978,6 +2775,7 @@ static void btn_open_settings_cb(lv_event_t *e)
 static void build_settings_screen(lv_obj_t *dash_scr)
 {
     lv_obj_t *scr = lv_scr_act();
+    s_settings_dash_scr = dash_scr;
 
     /* Fundo full-screen */
     lv_obj_t *backdrop = lv_obj_create(scr);
@@ -2064,25 +2862,17 @@ static void build_settings_screen(lv_obj_t *dash_scr)
     lv_obj_set_style_pad_row(menu_top, 4, LV_PART_MAIN);
     lv_obj_clear_flag(menu_top, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Item: Dispositivo (selecionado) */
-    lv_obj_t *mi_dev = lv_obj_create(menu_top);
-    lv_obj_remove_style_all(mi_dev);
-    lv_obj_set_width(mi_dev, lv_pct(100));
-    lv_obj_set_height(mi_dev, 52);
-    lv_obj_set_style_bg_color(mi_dev, lv_color_hex(0xF0EEFF), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(mi_dev, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(mi_dev, 10, LV_PART_MAIN);
-    lv_obj_set_style_border_side(mi_dev, LV_BORDER_SIDE_LEFT, LV_PART_MAIN);
-    lv_obj_set_style_border_color(mi_dev, COLOR_ACCENT, LV_PART_MAIN);
-    lv_obj_set_style_border_width(mi_dev, 3, LV_PART_MAIN);
-    lv_obj_set_style_pad_left(mi_dev, 14, LV_PART_MAIN);
-    lv_obj_set_flex_flow(mi_dev, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(mi_dev, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(mi_dev, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *lmi_dev = lv_label_create(mi_dev);
-    lv_label_set_text(lmi_dev, "Dispositivo");
-    lv_obj_set_style_text_font(lmi_dev, &lv_font_montserrat_24, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lmi_dev, COLOR_ACCENT, LV_PART_MAIN);
+    memset(&s_settings_nav, 0, sizeof(s_settings_nav));
+
+    /* Item: Dispositivo */
+    s_settings_nav.mi_dev = make_settings_menu_item(menu_top, "Dispositivo", &s_settings_nav.lbl_dev);
+    lv_obj_add_event_cb(s_settings_nav.mi_dev, settings_nav_dev_cb, LV_EVENT_CLICKED, NULL);
+    settings_menu_item_set_active(s_settings_nav.mi_dev, s_settings_nav.lbl_dev, true);
+
+    /* Item: Telas */
+    s_settings_nav.mi_telas = make_settings_menu_item(menu_top, "Telas", &s_settings_nav.lbl_telas);
+    lv_obj_add_event_cb(s_settings_nav.mi_telas, settings_nav_telas_cb, LV_EVENT_CLICKED, NULL);
+    settings_menu_item_set_active(s_settings_nav.mi_telas, s_settings_nav.lbl_telas, false);
 
     /* Item: Sair (parte inferior do sidebar) */
     lv_obj_t *mi_sair = lv_obj_create(sidebar);
@@ -2104,18 +2894,20 @@ static void build_settings_screen(lv_obj_t *dash_scr)
     lv_obj_set_style_text_font(lmi_sair, &lv_font_montserrat_24, LV_PART_MAIN);
     lv_obj_set_style_text_color(lmi_sair, lv_color_hex(0xB91C1C), LV_PART_MAIN);
 
-    /* Área de conteúdo à direita */
-    lv_obj_t *content = lv_obj_create(body);
-    lv_obj_remove_style_all(content);
-    lv_obj_set_flex_grow(content, 1);
-    lv_obj_set_height(content, lv_pct(100));
-    lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scroll_dir(content, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_all(content, 12, LV_PART_MAIN);
-    lv_obj_set_style_pad_row(content, 12, LV_PART_MAIN);
+    /* Área de conteúdo à direita (dois painéis: Dispositivo e Telas) */
+    lv_obj_t *content_host = lv_obj_create(body);
+    lv_obj_remove_style_all(content_host);
+    lv_obj_set_flex_grow(content_host, 1);
+    lv_obj_set_height(content_host, lv_pct(100));
+    lv_obj_set_flex_flow(content_host, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content_host, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(content_host, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_settings_nav.panel_dev = make_settings_content_panel(content_host);
+    lv_obj_t *content = s_settings_nav.panel_dev;
+
+    s_settings_nav.panel_telas = make_settings_content_panel(content_host);
+    lv_obj_add_flag(s_settings_nav.panel_telas, LV_OBJ_FLAG_HIDDEN);
 
     /* Card: Identificação do Robô */
     lv_obj_t *card_id = make_card(content);
@@ -2208,16 +3000,20 @@ static void build_dashboard_into(lv_obj_t *scr)
     s_bar_os_meds       = NULL;
     s_lbl_os_eta        = NULL;
     s_lbl_os_eta_detail = NULL;
+    s_lbl_bomba_state   = NULL;
+    s_lbl_valvula_state = NULL;
 
     historico_close_modal();
-    os_pick_timer_stop();
     os_close_modal();
+    stepper_close_modal();
     dev_kb_destroy();
     s_hist_scroll = NULL;
 
+    /* NAO paramos o timer de separacao nem zeramos s_os_active aqui:
+     * ao reconstruir o dashboard (ex.: apos re-login) a OS que estava
+     * a correr em segundo plano deve ser preservada e reexibida. */
     memset(&s_os, 0, sizeof(s_os));
     memset(&s_dev, 0, sizeof(s_dev));
-    s_os_active = false;
 
     lv_obj_set_style_bg_color(scr, COLOR_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
@@ -2432,6 +3228,45 @@ static void build_dashboard_into(lv_obj_t *scr)
         ui_os_paint_labels();
     }
 
+    /* ---------- Aba Motor de Passo ---------- */
+    {
+        lv_obj_t *t_at = lv_tabview_add_tab(tv, "Motor");
+        style_dashboard_tab_page(t_at);
+        lv_obj_set_style_pad_all(t_at, 8, LV_PART_MAIN);
+        lv_obj_set_style_pad_bottom(t_at, 68, LV_PART_MAIN);
+        lv_obj_set_style_pad_row(t_at, 8, LV_PART_MAIN);
+
+        lv_obj_t *card_step = make_card(t_at);
+        lv_obj_set_width(card_step, lv_pct(100));
+        lv_obj_set_height(card_step, 110);
+        lv_obj_set_flex_flow(card_step, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(card_step, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_bg_color(card_step, lv_color_hex(0xF7F5FF), LV_STATE_PRESSED);
+        lv_obj_add_flag(card_step, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card_step, stepper_open_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *col_st = lv_obj_create(card_step);
+        lv_obj_remove_style_all(col_st);
+        lv_obj_set_flex_grow(col_st, 1);
+        lv_obj_set_height(col_st, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(col_st, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(col_st, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_set_style_pad_row(col_st, 4, LV_PART_MAIN);
+        lv_obj_clear_flag(col_st, LV_OBJ_FLAG_SCROLLABLE);
+
+        make_card_label(col_st, "TESTE MOTOR DE PASSO");
+        lv_obj_t *st_sub = lv_label_create(col_st);
+        lv_label_set_text(st_sub, "STEP GPIO 20  ·  DIR GPIO 32");
+        lv_obj_set_style_text_font(st_sub, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_set_style_text_color(st_sub, COLOR_LABEL, LV_PART_MAIN);
+        lv_obj_t *st_hint = lv_label_create(col_st);
+        lv_label_set_text(st_hint, "Toque para escolher o sentido");
+        lv_obj_set_style_text_font(st_hint, &lv_font_montserrat_24, LV_PART_MAIN);
+        lv_obj_set_style_text_color(st_hint, COLOR_VALUE, LV_PART_MAIN);
+
+        historico_item_bubble_events(card_step);
+    }
+
     /* ---------- Aba Historico (lista de OS anteriores) ---------- */
     {
         lv_obj_t *t_hist = lv_tabview_add_tab(tv, "Historico");
@@ -2477,6 +3312,13 @@ static void build_dashboard_into(lv_obj_t *scr)
         s_cmd_timer = NULL;
     }
     s_cmd_timer = lv_timer_create(serial_cmd_timer_cb, 50, NULL);
+
+    /* Se uma OS foi concluida enquanto o utilizador estava fora, mostra
+     * agora o modal de conclusao que ficou pendente. */
+    if (s_os_concl_pending) {
+        s_os_concl_pending = false;
+        os_show_concluida_modal(s_os_concl_num, s_os_concl_total);
+    }
 }
 
 static void build_login_ui_into(lv_obj_t *scr)
@@ -2599,15 +3441,6 @@ static void build_login_ui_into(lv_obj_t *scr)
     lv_obj_update_layout(scr);
 }
 
-static void build_login_ui(void)
-{
-    if (!lvgl_port_lock(0)) {
-        APP_ERROR("Falha ao obter o lock do LVGL");
-        return;
-    }
-    build_login_ui_into(lv_scr_act());
-    lvgl_port_unlock();
-}
 
 static void build_ui(void)
 {
@@ -2713,12 +3546,26 @@ static void system_init(void)
 
     /* 0. NVS flash — persistência de configurações. */
     nvs_init();
+
+    /* 0a. GPIOs dos LEDs (relé) e motor de passo. */
+    led_gpio_init();
+    stepper_init();
     /* Carrega nome/código do robô na RAM para uso imediato. */
     strncpy(s_dev_robot_name, "Separador P4", sizeof(s_dev_robot_name) - 1);
     strncpy(s_dev_robot_code, "ESP32-P4-001", sizeof(s_dev_robot_code) - 1);
     nvs_load_device_config(s_dev_robot_name, sizeof s_dev_robot_name,
                            s_dev_robot_code, sizeof s_dev_robot_code);
-    APP_INFO("NVS ok — nome='%s' codigo='%s'", s_dev_robot_name, s_dev_robot_code);
+    /* Carrega configuração do motor de passo */
+    s_stepper_rpm       = nvs_load_u16(NVS_KEY_STEP_RPM,  60);
+    s_stepper_steps_rev = nvs_load_u16(NVS_KEY_STEP_SPR,  200);
+    s_stepper_ms_idx    = nvs_load_u8 (NVS_KEY_STEP_MSTP, 0);
+    if (s_stepper_rpm < 1 || s_stepper_rpm > 2000)  { s_stepper_rpm = 60; }
+    if (s_stepper_steps_rev < 1)                     { s_stepper_steps_rev = 200; }
+    if (s_stepper_ms_idx >= MICROSTEP_COUNT)         { s_stepper_ms_idx = 0; }
+    APP_INFO("NVS ok — nome='%s' codigo='%s' stepper=%uRPM/%u/%ux",
+             s_dev_robot_name, s_dev_robot_code,
+             s_stepper_rpm, s_stepper_steps_rev,
+             (unsigned)MICROSTEP_OPTIONS[s_stepper_ms_idx]);
 
     /* 1. LDOs internos: alimentam o transmissor MIPI-DSI do P4. */
     esp_ldo_channel_config_t ldo3_cfg = { .chan_id = 3, .voltage_mv = 2500 };

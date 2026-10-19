@@ -27,5 +27,6 @@
     "esp_lvgl_port.h": "c",
     "lvgl.h": "c"
   },
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.port": "COM4"
 }
