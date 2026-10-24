@@ -87,24 +87,160 @@ static lv_timer_t *s_dash_timer    = NULL;
 
 /* ----- Comandos recebidos do gateway (Web → ESP32) ----- */
 typedef enum {
-    CMD_OS_ASSIGN   = 0,
-    CMD_OS_COMPLETE = 1,
-    CMD_OS_CANCEL   = 2,
-    CMD_OS_PAUSE    = 3,
-    CMD_OS_RESUME   = 4,
-    CMD_PING        = 5,
-    CMD_SET_DEVICE  = 6,
+    CMD_OS_ASSIGN    = 0,
+    CMD_OS_COMPLETE  = 1,
+    CMD_OS_CANCEL    = 2,
+    CMD_OS_PAUSE     = 3,
+    CMD_OS_RESUME    = 4,
+    CMD_PING         = 5,
+    CMD_SET_DEVICE   = 6,
+    CMD_CATALOG_ITEM = 7,
+    CMD_CATALOG_END  = 8,
+    CMD_UNIT_DONE    = 9,   /* software confirmou coleta de 1 remedio */
 } serial_cmd_type_t;
 
 typedef struct {
     serial_cmd_type_t type;
-    char     num[OS_NUM_BUF_SZ];
+    char     num   [OS_NUM_BUF_SZ];
     char     client[OS_CLIENT_BUF_SZ];
     uint32_t total;
     char     reason[OS_HIST_MOTIVO_SZ];
 } serial_cmd_t;
 
-#define SERIAL_CMD_QUEUE_LEN 8
+#define SERIAL_CMD_QUEUE_LEN 16
+
+/* ----- Catálogo de remédios e cesta (seleção para OS) ----- */
+#define CATALOG_ID_SZ    20
+#define CATALOG_NM_SZ    52
+#define CATALOG_MAX     300
+#define BASKET_MAX       40
+
+typedef struct { char id[CATALOG_ID_SZ]; char nome[CATALOG_NM_SZ]; } catalog_item_t;
+typedef struct { char id[CATALOG_ID_SZ]; char nome[CATALOG_NM_SZ]; int qty; } basket_item_t;
+
+/* Catálogo embutido no firmware — carregado do Excel do EMR */
+static const catalog_item_t BUILTIN_CATALOG[] = {
+    {"10091","ADEQUA 1000MG CX C/1 SACHE"},
+    {"10000","ALOIS 10MG CX C/7 CP"},
+    {"10036","ALOIS 20MG C/10 CP"},
+    {"10001","ALOIS GOTAS 10MG/ML 15ML"},
+    {"10002","ARPADOL 400MG CX C/5 CP"},
+    {"10063","ATENTAH 10MG CX C10 CAPS"},
+    {"10064","ATENTAH 18MG CX C10 CAPS"},
+    {"10066","ATENTAH 25MG CX C/10 CAPS"},
+    {"10065","ATENTAH 40MG CX C10 CAPS"},
+    {"10003","AZULFIN 500MG CX C/15 CP"},
+    {"10087","COBI-12 1000MCG CX C/4 CP SUB"},
+    {"10004","COLCHIS 0,5MG CX C/15 CP"},
+    {"10005","DESOL 200UI/GT CX C/1 FR 2ML"},
+    {"10006","DIGELIV 400 FCC GALU CX C/2 SACHES"},
+    {"10057","DIGELIV 400 GALU CX C/2 CP MAST"},
+    {"10075","DOBEVEN 500MG CX C/4 CAP"},
+    {"10007","DONAREN 50MG CX C/5 CP"},
+    {"10008","DONAREN RETARD 150MG CX C/5"},
+    {"10071","DUEPOLI ER 250MG CX C6 CP"},
+    {"10072","DUEPOLI ER 500MG CX C6 CP"},
+    {"10043","ENIAGOR 50MG/ML SOLUCAO CAPILAR 25ML"},
+    {"10081","EXTIMA BANANA CX C/1 SACHE"},
+    {"10080","EXTIMA BAUNILHA CX C/1 SACHE"},
+    {"10082","EXTIMA CHOCOLATE CX C/1 SACHE"},
+    {"10009","FITOSCAR 10G"},
+    {"10047","FLANCOX 500MG C/2 CP"},
+    {"10058","FLANCOX 600MG CX C/2 CP"},
+    {"10088","FLORACOL CX C/2 SACHES"},
+    {"10039","INILOK 40MG CX C/3 CP"},
+    {"10079","INPRUV DK 50.000UI+100MCG C/2 CP"},
+    {"10078","INPRUV DK 7.000UI+100MCG C/2 CP"},
+    {"10051","INSERIS XR 150MG CX C/10 CP"},
+    {"10050","INSERIS XR 300MG CX C/10 CP"},
+    {"10049","INSIT 100MG CX C/7 CAPS"},
+    {"10046","INSIT 25MG C/7 CAPS"},
+    {"10033","INSIT 50MG CX C/7 CAPS"},
+    {"10034","INSIT 75MG CX C/7 CAPS"},
+    {"10095","INSIT SOLUCAO ORAL 25MG/ML 18ML"},
+    {"10010","LABIRIN 24MG CX C/15 CP"},
+    {"10073","LABIRIN XR 32MG CX C5 CP"},
+    {"10074","LABIRIN XR 48MG CX C5 CP"},
+    {"10011","LACTOSIL 10.000 FCC ALU CX C/2 SACHES"},
+    {"10012","LACTOSIL 10.000 FCC CX C/2 COMPRIMIDOS"},
+    {"10013","LACTOSIL 4.500 FCC ALU CX C/2 SACHES"},
+    {"10014","LACTOSIL 4.500 FCC CX C/2 COMPRIMIDOS"},
+    {"10038","LACTOSIL FLORA CX C/4 CAPS"},
+    {"10076","LECZA XR 500MG CX C/7 CPRV"},
+    {"10077","LECZA XR 750MG CX C/7 CPRV"},
+    {"10092","LENIX 50MG CX C/2 CP"},
+    {"10015","LEVOXIN 500MG CX C/3 CP"},
+    {"10016","LEVOXIN 750MG CX C/3 CP"},
+    {"10040","LITOCIT 15MEQ CX C/15CP"},
+    {"10044","LOGNIS C/4 CP"},
+    {"10017","LONIUM 40MG CX C/5 CP"},
+    {"10093","LURATT 20MG CX C10 CP"},
+    {"10094","LURATT 40MG CX C10 CP"},
+    {"10045","MAG B C/2 CP"},
+    {"10018","MECLIN 25MG CX C/5 CP"},
+    {"10019","MECLIN 50MG CX C/5 CP"},
+    {"10060","MECLIN JET 25MG CX C/2 CP MAST"},
+    {"10061","MECLIN JET 50MG CX C/2 CP MAST"},
+    {"10084","MECLIN MOVE 25MG CX C/2 CP"},
+    {"10067","MICPURE 50MG CX C5 CP"},
+    {"10083","MICROBIX CX C/2 CAPS"},
+    {"10020","MIOSAN 5MG C/2 CP"},
+    {"10021","MIOSAN CAF 10/60 MG CX C/2 CP"},
+    {"10022","MIOSAN CAF 5/30 MG CX C/2 CP"},
+    {"10070","MIOSAN ODT 10MG CX C/2 CP OROD"},
+    {"10069","MIOSAN ODT 5MG CX C/2 CP OROD"},
+    {"10023","MOMENT 0,025% CREME 25G"},
+    {"10035","MOTILEX CX C/2 CAPS"},
+    {"10037","MOTILEX HA C2 CAPS"},
+    {"10062","MOTILEX HA+MSM CX C/2 CP"},
+    {"10086","PAXORAL 3,5MG CX C/5 CAP"},
+    {"10085","PAXORAL 7MG CX C/5 CAP"},
+    {"10024","POSTEC POMADA 5G"},
+    {"10042","PROBIANS CX C/2 CAPS"},
+    {"10041","PROBID CX C/2 CAPS"},
+    {"10056","RAHIME 8MG CX C5 CP"},
+    {"10025","RETEMIC 5MG CX C/15 CP"},
+    {"10026","RETEMIC UD 10MG CX C/8 CP"},
+    {"10027","REUQUINOL 400MG CX C/6 CP"},
+    {"10089","SIL-HP 4MG CX C/4 CAPS"},
+    {"10090","SIL-HP 8MG CX C/4 CAPS"},
+    {"10048","SPASMEX 30MG CX C/10 CP"},
+    {"10068","TANDUO 0,4MG + 0,5MG CX C/4 CAPS"},
+    {"10028","TRATURIL 5,631G/8G CX C/1 ENV"},
+    {"10029","UNOPROST 2 MG CX C/15 CP"},
+    {"10030","UNOPROST 4MG CX C/15 CPR"},
+    {"10031","URO VAXOM 6 MG CX C/5 CAP"},
+    {"10032","VELUS CX C/2 CP"},
+    {"10055","XAFAC 10MG CX C5 CP"},
+    {"10053","XAFAC 15MG CX C7 CP"},
+    {"10052","XAFAC 2,5MG CX C7 CP"},
+    {"10054","XAFAC 20MG CX C7 CP"},
+    {"10059","ZANIDIP 10MG C/5 CP"},
+};
+#define BUILTIN_CATALOG_COUNT ((int)(sizeof(BUILTIN_CATALOG)/sizeof(BUILTIN_CATALOG[0])))
+
+static catalog_item_t s_catalog[CATALOG_MAX];
+static volatile int   s_catalog_count   = 0;
+static volatile bool  s_catalog_loading = false;
+
+static basket_item_t  s_basket[BASKET_MAX];
+static int            s_basket_count = 0;
+
+/* Linhas de remedio no formulario da OS */
+#define OS_ITEM_ROWS_MAX 20
+typedef struct {
+    lv_obj_t *row;
+    lv_obj_t *dd;
+    lv_obj_t *lbl_qty;
+    int       qty;
+} os_item_row_t;
+static os_item_row_t s_os_rows[OS_ITEM_ROWS_MAX];
+static int           s_os_rows_count      = 0;
+static lv_obj_t     *s_os_items_section   = NULL;
+static lv_obj_t     *s_os_items_cont      = NULL;
+static lv_obj_t     *s_os_lbl_items_total = NULL;
+static char          s_catalog_opts[(CATALOG_MAX + 1) * CATALOG_NM_SZ];
+static bool          s_os_coletar_todos   = false;
 
 static QueueHandle_t  s_cmd_queue      = NULL;
 static lv_timer_t    *s_cmd_timer      = NULL;
@@ -207,6 +343,9 @@ static void serial_bridge_os_pause(const char *num);
 static void serial_bridge_os_resume(const char *num);
 static void stepper_stop(void);
 static void stepper_close_modal(void);
+static void serial_bridge_req_catalog(void);
+static void catalog_load_builtin(void);
+static void os_coletar_todos_cb(lv_event_t *e);
 
 /* --------------------------------------------------------------------------
  * NVS — persistência de nome e código do robô
@@ -1074,6 +1213,10 @@ static void os_close_modal(void)
         s_os.ta_total = NULL;
         s_os.ta_motivo = NULL;
     }
+    s_os_items_section   = NULL;
+    s_os_items_cont      = NULL;
+    s_os_lbl_items_total = NULL;
+    s_os_rows_count      = 0;
 }
 
 static void os_update_panels(void)
@@ -1687,7 +1830,231 @@ static void stepper_open_cb(lv_event_t *e)
     lv_obj_move_foreground(backdrop);
 }
 
+/* ====================================================================
+ * Catalogo embutido - carrega no boot sem necessidade de gateway
+ * ==================================================================== */
+static void catalog_load_builtin(void)
+{
+    int n = BUILTIN_CATALOG_COUNT;
+    if (n > CATALOG_MAX) { n = CATALOG_MAX; }
+    for (int i = 0; i < n; i++) {
+        str_copy_trunc(s_catalog[i].id,   CATALOG_ID_SZ, BUILTIN_CATALOG[i].id);
+        str_copy_trunc(s_catalog[i].nome, CATALOG_NM_SZ, BUILTIN_CATALOG[i].nome);
+    }
+    s_catalog_count   = n;
+    s_catalog_loading = false;
+    APP_INFO("Catalogo embutido carregado: %d remedios", n);
+}
+
+/* ====================================================================
+ * Cesta de remedios (preenchida a partir das linhas do formulario ao iniciar)
+ * ==================================================================== */
+
+static int basket_find(const char *id)
+{
+    for (int i = 0; i < s_basket_count; i++) {
+        if (strncmp(s_basket[i].id, id, CATALOG_ID_SZ) == 0) { return i; }
+    }
+    return -1;
+}
+
+static bool basket_add_qty(const catalog_item_t *item, int qty)
+{
+    if (qty <= 0) { return false; }
+    int idx = basket_find(item->id);
+    if (idx >= 0) { s_basket[idx].qty += qty; return true; }
+    if (s_basket_count >= BASKET_MAX) { return false; }
+    str_copy_trunc(s_basket[s_basket_count].id,   CATALOG_ID_SZ, item->id);
+    str_copy_trunc(s_basket[s_basket_count].nome, CATALOG_NM_SZ, item->nome);
+    s_basket[s_basket_count].qty = qty;
+    s_basket_count++;
+    return true;
+}
+
+static int basket_total_qty(void)
+{
+    int t = 0;
+    for (int i = 0; i < s_basket_count; i++) { t += s_basket[i].qty; }
+    return t;
+}
+
+static void basket_clear(void) { s_basket_count = 0; }
+
+/* ====================================================================
+ * Linhas de remedio no formulario da OS:
+ *   [lista de remedios v]  [-] qtd [+]  [X]
+ *   [+ Adicionar remedio]
+ * ==================================================================== */
+
+/* Opcoes compartilhadas por todos os dropdowns (lv_dropdown_set_options_static
+ * nao copia, entao precisa continuar valida enquanto o formulario existir). */
+static void catalog_build_opts(void)
+{
+    size_t cap = sizeof s_catalog_opts;
+    int n = snprintf(s_catalog_opts, cap, "Selecione o remedio");
+    size_t pos = (n > 0) ? (size_t)n : 0;
+    for (int i = 0; i < s_catalog_count && pos < cap; i++) {
+        n = snprintf(s_catalog_opts + pos, cap - pos, "\n%s", s_catalog[i].nome);
+        if (n <= 0) { break; }
+        pos += (size_t)n;
+    }
+}
+
+static int os_items_find(const lv_obj_t *row)
+{
+    for (int i = 0; i < s_os_rows_count; i++) {
+        if (s_os_rows[i].row == row) { return i; }
+    }
+    return -1;
+}
+
+static void os_items_refresh_total(void)
+{
+    if (!s_os_lbl_items_total) { return; }
+    int tot = 0;
+    for (int i = 0; i < s_os_rows_count; i++) {
+        if (lv_dropdown_get_selected(s_os_rows[i].dd) > 0) { tot += s_os_rows[i].qty; }
+    }
+    lv_label_set_text_fmt(s_os_lbl_items_total, "Total: %d un.", tot);
+}
+
+static void os_item_set_qty(int idx, int qty)
+{
+    if (qty < 1)   { qty = 1; }
+    if (qty > 999) { qty = 999; }
+    s_os_rows[idx].qty = qty;
+    lv_label_set_text_fmt(s_os_rows[idx].lbl_qty, "%d", qty);
+    os_items_refresh_total();
+}
+
+static void os_item_minus_cb(lv_event_t *e)
+{
+    int idx = os_items_find(lv_event_get_user_data(e));
+    if (idx >= 0) { os_item_set_qty(idx, s_os_rows[idx].qty - 1); }
+}
+
+static void os_item_plus_cb(lv_event_t *e)
+{
+    int idx = os_items_find(lv_event_get_user_data(e));
+    if (idx >= 0) { os_item_set_qty(idx, s_os_rows[idx].qty + 1); }
+}
+
+static void os_item_dd_cb(lv_event_t *e)
+{
+    (void)e;
+    os_items_refresh_total();
+}
+
+static void os_item_remove_cb(lv_event_t *e)
+{
+    lv_obj_t *row = lv_event_get_user_data(e);
+    int idx = os_items_find(row);
+    if (idx < 0) { return; }
+    for (int i = idx; i < s_os_rows_count - 1; i++) { s_os_rows[i] = s_os_rows[i + 1]; }
+    s_os_rows_count--;
+    /* O botao clicado e filho da linha: apagar de forma assincrona. */
+    lv_obj_del_async(row);
+    os_items_refresh_total();
+}
+
+static lv_obj_t *os_item_small_btn(lv_obj_t *parent, const char *txt, lv_color_t bg, lv_color_t fg,
+                                   lv_event_cb_t cb, lv_obj_t *row)
+{
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_set_size(b, 56, 56);
+    lv_obj_set_style_radius(b, 12, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b, bg, LV_PART_MAIN);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, row);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, fg, LV_PART_MAIN);
+    lv_obj_center(l);
+    return b;
+}
+
+static void os_items_add_row(void)
+{
+    if (!s_os_items_cont) { return; }
+    if (s_os_rows_count >= OS_ITEM_ROWS_MAX) {
+        APP_WARN("OS manual: limite de %d linhas de remedio", OS_ITEM_ROWS_MAX);
+        return;
+    }
+
+    lv_obj_t *row = lv_obj_create(s_os_items_cont);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 60);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 8, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dd = lv_dropdown_create(row);
+    lv_dropdown_set_options_static(dd, s_catalog_opts);
+    lv_obj_set_flex_grow(dd, 1);
+    lv_obj_set_height(dd, 56);
+    lv_obj_set_style_text_font(dd, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_t *dd_list = lv_dropdown_get_list(dd);
+    if (dd_list) {
+        lv_obj_set_style_text_font(dd_list, &lv_font_montserrat_24, LV_PART_MAIN);
+        lv_obj_set_style_max_height(dd_list, 380, LV_PART_MAIN);
+    }
+    lv_obj_add_event_cb(dd, os_item_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    os_item_small_btn(row, LV_SYMBOL_MINUS, COLOR_ACCENT_DARK, lv_color_white(), os_item_minus_cb, row);
+
+    lv_obj_t *lq = lv_label_create(row);
+    lv_label_set_text(lq, "1");
+    lv_obj_set_width(lq, 64);
+    lv_obj_set_style_text_align(lq, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lq, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lq, COLOR_VALUE, LV_PART_MAIN);
+
+    os_item_small_btn(row, LV_SYMBOL_PLUS, COLOR_ACCENT, lv_color_white(), os_item_plus_cb, row);
+    os_item_small_btn(row, LV_SYMBOL_CLOSE, lv_color_hex(0xFEE2E2), lv_color_hex(0xB91C1C),
+                      os_item_remove_cb, row);
+
+    s_os_rows[s_os_rows_count].row     = row;
+    s_os_rows[s_os_rows_count].dd      = dd;
+    s_os_rows[s_os_rows_count].lbl_qty = lq;
+    s_os_rows[s_os_rows_count].qty     = 1;
+    s_os_rows_count++;
+    os_items_refresh_total();
+}
+
+static void os_items_add_cb(lv_event_t *e)
+{
+    (void)e;
+    os_items_add_row();
+}
+
+/* Copia as linhas validas para a cesta (agrupa remedios repetidos). */
+static int os_items_collect(void)
+{
+    basket_clear();
+    for (int i = 0; i < s_os_rows_count; i++) {
+        int sel = (int)lv_dropdown_get_selected(s_os_rows[i].dd);
+        int ci  = sel - 1;
+        if (ci < 0 || ci >= s_catalog_count) { continue; }
+        basket_add_qty(&s_catalog[ci], s_os_rows[i].qty);
+    }
+    return basket_total_qty();
+}
+
+static void os_coletar_todos_cb(lv_event_t *e)
+{
+    lv_obj_t *cb = lv_event_get_target(e);
+    s_os_coletar_todos = lv_obj_has_state(cb, LV_STATE_CHECKED);
+    if (!s_os_items_section) { return; }
+    if (s_os_coletar_todos) {
+        lv_obj_add_flag(s_os_items_section, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(s_os_items_section, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 /* ==================================================================== */
+
 
 static void os_reset_idle(void)
 {
@@ -1703,6 +2070,7 @@ static void os_reset_idle(void)
     s_os_sess_start_us    = 0;
     led_amarelo_set(false);
     led_vermelho_blink_stop();
+    basket_clear();
     os_update_panels();
     ui_os_paint_labels();
 }
@@ -1738,8 +2106,33 @@ static void serial_bridge_os_start(const char *num, const char *client, uint32_t
     char ec[OS_CLIENT_BUF_SZ * 2];
     serial_bridge_escape(en, sizeof en, num);
     serial_bridge_escape(ec, sizeof ec, client);
-    printf("BRIDGE:{\"ev\":\"os_start\",\"robot\":\"%s\",\"num\":\"%s\",\"client\":\"%s\",\"total\":%lu}\n",
-           BRIDGE_ROBOT_CODE, en, ec, (unsigned long)total);
+
+    if (s_basket_count > 0) {
+        /* Inclui a lista de itens selecionados no catálogo */
+        static char items_buf[1280];
+        items_buf[0] = '['; items_buf[1] = '\0';
+        for (int bi = 0; bi < s_basket_count; bi++) {
+            char part[96];
+            char eid[CATALOG_ID_SZ * 2];
+            serial_bridge_escape(eid, sizeof eid, s_basket[bi].id);
+            snprintf(part, sizeof part, "%s{\"id\":\"%s\",\"qty\":%d}",
+                     bi > 0 ? "," : "", eid, s_basket[bi].qty);
+            size_t cur = strlen(items_buf);
+            size_t add = strlen(part);
+            if (cur + add + 2 < sizeof(items_buf)) {
+                memcpy(items_buf + cur, part, add + 1);
+            }
+        }
+        size_t cl = strlen(items_buf);
+        if (cl + 2 < sizeof(items_buf)) { items_buf[cl] = ']'; items_buf[cl+1] = '\0'; }
+        printf("BRIDGE:{\"ev\":\"os_start\",\"robot\":\"%s\",\"num\":\"%s\","
+               "\"client\":\"%s\",\"total\":%lu,\"items\":%s}\n",
+               BRIDGE_ROBOT_CODE, en, ec, (unsigned long)total, items_buf);
+    } else {
+        printf("BRIDGE:{\"ev\":\"os_start\",\"robot\":\"%s\",\"num\":\"%s\","
+               "\"client\":\"%s\",\"total\":%lu}\n",
+               BRIDGE_ROBOT_CODE, en, ec, (unsigned long)total);
+    }
 }
 
 static void serial_bridge_unit(const char *num, uint32_t done)
@@ -1801,6 +2194,15 @@ static void serial_bridge_os_resume(const char *num)
     APP_INFO("[BRIDGE os_resume] %s", num);
 }
 
+static void serial_bridge_req_catalog(void) __attribute__((unused));
+static void serial_bridge_req_catalog(void)
+{
+    s_catalog_count   = 0;
+    s_catalog_loading = true;
+    printf("BRIDGE:{\"ev\":\"req_catalog\"}\n");
+    APP_INFO("[BRIDGE req_catalog] solicitando catalogo...");
+}
+
 /* ====================================================================
  * Recepção de comandos do gateway (Web → ESP32)
  * O gateway escreve linhas "CMD:{json}" na porta serial.
@@ -1833,6 +2235,40 @@ static void serial_cmd_task(void *arg)
         serial_cmd_t cmd;
         memset(&cmd, 0, sizeof(cmd));
 
+        /* catalog_item é tratado diretamente sem ir para a fila (pode ser 300+) */
+        if (strstr(p, "\"catalog_item\"")) {
+            int ci = s_catalog_count;
+            if (ci < CATALOG_MAX) {
+                /* extrai "id" e "name" */
+                const char *flds[2]  = { "id", "name" };
+                char       *dsts2[2] = { s_catalog[ci].id, s_catalog[ci].nome };
+                size_t      caps2[2] = { CATALOG_ID_SZ,    CATALOG_NM_SZ };
+                for (int fi2 = 0; fi2 < 2; fi2++) {
+                    char key2[16];
+                    snprintf(key2, sizeof key2, "\"%s\":\"", flds[fi2]);
+                    char *st2 = strstr(p, key2);
+                    if (!st2) { continue; }
+                    st2 += strlen(key2);
+                    char *en2 = strchr(st2, '"');
+                    if (!en2) { continue; }
+                    size_t n2 = (size_t)(en2 - st2);
+                    if (n2 >= caps2[fi2]) { n2 = caps2[fi2] - 1; }
+                    memcpy(dsts2[fi2], st2, n2);
+                    dsts2[fi2][n2] = '\0';
+                }
+                s_catalog_count = ci + 1;
+            }
+            continue; /* não vai para a fila */
+        }
+        if (strstr(p, "\"catalog_end\"")) {
+            s_catalog_loading = false;
+            cmd.type  = CMD_CATALOG_END;
+            cmd.total = (uint32_t)s_catalog_count;
+            xQueueSend(s_cmd_queue, &cmd, 0);
+            APP_INFO("[CMD] catalog_end: %d itens", s_catalog_count);
+            continue;
+        }
+
         /* Determina tipo pelo campo "cmd". */
         if (strstr(p, "\"os_assign\""))       { cmd.type = CMD_OS_ASSIGN;   }
         else if (strstr(p, "\"os_complete\"")) { cmd.type = CMD_OS_COMPLETE; }
@@ -1841,6 +2277,7 @@ static void serial_cmd_task(void *arg)
         else if (strstr(p, "\"os_resume\""))   { cmd.type = CMD_OS_RESUME;   }
         else if (strstr(p, "\"ping\""))        { cmd.type = CMD_PING;        }
         else if (strstr(p, "\"set_device\"")) { cmd.type = CMD_SET_DEVICE;  }
+        else if (strstr(p, "\"unit_done\""))  { cmd.type = CMD_UNIT_DONE;   }
         else { continue; }
 
         /* Extrai strings: procura "chave":"valor"
@@ -1914,6 +2351,32 @@ static void serial_cmd_timer_cb(lv_timer_t *t)
                 APP_INFO("[CMD] os_resume: %s", cmd.num);
                 os_resume();
             }
+        } else if (cmd.type == CMD_UNIT_DONE) {
+            /* Software confirmou coleta de 1 remédio */
+            if (s_os_active && !s_os_paused) {
+                if (s_os_meds_done < s_os_meds_total || s_os_meds_total == 0) {
+                    uint64_t now_us = esp_timer_get_time();
+                    if (s_os_meds_done > 0 && s_os_sess_start_us > 0) {
+                        uint32_t elapsed_ms = (uint32_t)((now_us - s_os_sess_start_us) / 1000ULL);
+                        uint32_t per_item   = s_os_meds_done > 0
+                                              ? elapsed_ms / s_os_meds_done : 0;
+                        s_os_pick_ms_sum += (uint64_t)per_item;
+                        s_os_pick_samples++;
+                    }
+                    s_os_meds_done++;
+                    APP_INFO("[CMD] unit_done: %lu/%lu", (unsigned long)s_os_meds_done,
+                             (unsigned long)s_os_meds_total);
+                    ui_os_paint_labels();
+                    /* Envia progresso de volta ao gateway */
+                    serial_bridge_unit(s_os_num_str, s_os_meds_done);
+                    /* Checa conclusão automática quando total é conhecido */
+                    if (s_os_meds_total > 0 && s_os_meds_done >= s_os_meds_total) {
+                        os_finalize_concluida();
+                    }
+                }
+            }
+        } else if (cmd.type == CMD_CATALOG_END) {
+            APP_INFO("[CMD] catalogo carregado: %lu itens", (unsigned long)cmd.total);
         } else if (cmd.type == CMD_PING) {
             APP_INFO("[CMD] ping recebido — respondendo com pong");
             serial_bridge_pong();
@@ -2111,48 +2574,22 @@ static void os_finalize_cancelada(const char *motivo)
  * display já renderizou o novo contador antes de o backend receber o evento.
  * Isso evita a aparência de "+1" no software enquanto a tela ainda mostra
  * o valor anterior. */
+static void serial_bridge_unit_deferred_cb(lv_timer_t *t) __attribute__((unused));
 static void serial_bridge_unit_deferred_cb(lv_timer_t *t)
 {
     (void)t;
     if (!s_bridge_unit_pending || !s_os_active) { return; }
     s_bridge_unit_pending = false;
     serial_bridge_unit(s_os_num_str, s_bridge_unit_pending_done);
-    if (s_bridge_unit_pending_done >= s_os_meds_total) {
-        os_finalize_concluida();
-    } else if (!s_os_paused) {
-        os_schedule_next_pick();
-    }
+    /* Finalização agora disparada pelo CMD_UNIT_DONE quando total alcançado */
 }
 
-static void os_pick_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    s_os_pick_timer = NULL;
-    if (!s_os_active || s_os_meds_total == 0 || s_os_meds_done >= s_os_meds_total) {
-        return;
-    }
-    uint32_t pick_ms = 2000 + (esp_random() % 8001U);
-    s_os_meds_done++;
-    s_os_pick_ms_sum += (uint64_t)pick_ms;
-    s_os_pick_samples++;
-    ui_os_paint_labels();  /* atualiza tela imediatamente */
-
-    /* Agenda envio do BRIDGE:unit para depois do próximo frame renderizado */
-    s_bridge_unit_pending_done = s_os_meds_done;
-    s_bridge_unit_pending      = true;
-    lv_timer_t *defer = lv_timer_create(serial_bridge_unit_deferred_cb, 20, NULL);
-    lv_timer_set_repeat_count(defer, 1);
-}
-
+/* Simulação removida — coleta é confirmada pelo software via CMD:unit_done */
+static void os_schedule_next_pick(void) __attribute__((unused));
 static void os_schedule_next_pick(void)
 {
-    os_pick_timer_stop();
-    if (!s_os_active || s_os_meds_total == 0 || s_os_meds_done >= s_os_meds_total) {
-        return;
-    }
-    uint32_t delay_ms = 2000 + (esp_random() % 8001U);
-    s_os_pick_timer = lv_timer_create(os_pick_timer_cb, delay_ms, NULL);
-    lv_timer_set_repeat_count(s_os_pick_timer, 1);
+    /* sem-op: o software envia CMD unit_done para cada remédio coletado */
+    (void)0;
 }
 
 static void os_start_manual(const char *numero, const char *cliente, uint32_t total)
@@ -2170,7 +2607,7 @@ static void os_start_manual(const char *numero, const char *cliente, uint32_t to
     led_amarelo_set(true);
     os_update_panels();
     ui_os_paint_labels();
-    os_schedule_next_pick();
+    /* Sem simulação — aguarda CMD:unit_done do software */
     serial_bridge_os_start(s_os_num_str, s_os_client_str, total);
     APP_INFO("OS manual iniciada: %s (%lu remedios)", s_os_num_str, (unsigned long)total);
 }
@@ -2191,11 +2628,6 @@ static void os_resume(void)
     if (!s_os_active || !s_os_paused) { return; }
     s_os_paused = false;
     led_vermelho_blink_stop();
-    /* Se há um pick em voo aguardando o deferred, ele agendará o próximo pick
-     * sozinho ao ser processado; caso contrário, agendamos aqui. */
-    if (!s_bridge_unit_pending) {
-        os_schedule_next_pick();
-    }
     ui_os_paint_labels();
     serial_bridge_os_resume(s_os_num_str);
     APP_INFO("OS %s retomada", s_os_num_str);
@@ -2265,26 +2697,22 @@ static void os_manual_iniciar_cb(lv_event_t *e)
         APP_WARN("OS manual: numero e cliente obrigatorios");
         return;
     }
-    bool ok = false;
+
     uint32_t total = 0;
-    if (s_os.ta_total) {
-        const char *ts = lv_textarea_get_text(s_os.ta_total);
-        if (ts && ts[0]) {
-            char *end = NULL;
-            unsigned long v = strtoul(ts, &end, 10);
-            while (end && *end == ' ') {
-                end++;
-            }
-            if (end && *end == '\0' && v > 0 && v <= 9999) {
-                total = (uint32_t)v;
-                ok    = true;
-            }
+
+    if (s_os_coletar_todos) {
+        /* Modo "Coletar todos": nao exige total, software define quais remedios */
+        basket_clear();
+        total = 0;
+    } else {
+        int basket_tot = os_items_collect();
+        if (basket_tot <= 0) {
+            APP_WARN("OS manual: selecione ao menos 1 remedio ou marque 'Coletar todos'");
+            return;
         }
+        total = (uint32_t)basket_tot;
     }
-    if (!ok) {
-        APP_WARN("OS manual: total de remedios invalido (1-9999)");
-        return;
-    }
+
     os_start_manual(num, cli, total);
 }
 
@@ -2327,16 +2755,67 @@ static void os_open_manual_modal(void)
     lv_textarea_set_max_length(s_os.ta_client, OS_CLIENT_BUF_SZ - 1);
     style_os_form_field(s_os.ta_client, false);
 
-    lv_obj_t *lt = lv_label_create(card);
-    lv_label_set_text(lt, "Total de remedios");
+    /* Checkbox "Coletar todos" */
+    lv_obj_t *row_cb = lv_obj_create(card);
+    lv_obj_remove_style_all(row_cb);
+    lv_obj_set_width(row_cb, lv_pct(100));
+    lv_obj_set_height(row_cb, 52);
+    lv_obj_set_flex_flow(row_cb, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row_cb, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row_cb, 12, LV_PART_MAIN);
+    lv_obj_clear_flag(row_cb, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cb_todos = lv_checkbox_create(row_cb);
+    lv_checkbox_set_text(cb_todos, "Coletar todos");
+    lv_obj_set_style_text_font(cb_todos, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(cb_todos, COLOR_VALUE, LV_PART_MAIN);
+    if (s_os_coletar_todos) {
+        lv_obj_add_state(cb_todos, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(cb_todos, os_coletar_todos_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* Remedios: uma linha por remedio (lista + quantidade), oculta em "Coletar todos" */
+    s_os_items_section = lv_obj_create(card);
+    lv_obj_remove_style_all(s_os_items_section);
+    lv_obj_set_width(s_os_items_section, lv_pct(100));
+    lv_obj_set_height(s_os_items_section, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_os_items_section, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_os_items_section, 10, LV_PART_MAIN);
+    lv_obj_clear_flag(s_os_items_section, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lt = lv_label_create(s_os_items_section);
+    lv_label_set_text(lt, "Remedios");
     lv_obj_set_style_text_font(lt, &lv_font_montserrat_24, LV_PART_MAIN);
     lv_obj_set_style_text_color(lt, COLOR_LABEL, LV_PART_MAIN);
 
-    s_os.ta_total = lv_textarea_create(card);
-    lv_textarea_set_one_line(s_os.ta_total, true);
-    lv_textarea_set_max_length(s_os.ta_total, 4);
-    lv_textarea_set_accepted_chars(s_os.ta_total, "0123456789");
-    style_os_form_field(s_os.ta_total, true);
+    s_os_items_cont = lv_obj_create(s_os_items_section);
+    lv_obj_remove_style_all(s_os_items_cont);
+    lv_obj_set_width(s_os_items_cont, lv_pct(100));
+    lv_obj_set_height(s_os_items_cont, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_os_items_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_os_items_cont, 8, LV_PART_MAIN);
+    lv_obj_clear_flag(s_os_items_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *b_add = lv_btn_create(s_os_items_section);
+    lv_obj_set_width(b_add, lv_pct(100));
+    lv_obj_set_height(b_add, 52);
+    lv_obj_set_style_radius(b_add, 12, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b_add, COLOR_ACCENT_DARK, LV_PART_MAIN);
+    lv_obj_add_event_cb(b_add, os_items_add_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *l_add = lv_label_create(b_add);
+    lv_label_set_text(l_add, LV_SYMBOL_PLUS "  Adicionar remedio");
+    lv_obj_set_style_text_font(l_add, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l_add, lv_color_white(), LV_PART_MAIN);
+    lv_obj_center(l_add);
+
+    s_os_lbl_items_total = lv_label_create(s_os_items_section);
+    lv_obj_set_style_text_font(s_os_lbl_items_total, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_os_lbl_items_total, COLOR_VALUE, LV_PART_MAIN);
+
+    s_os_rows_count = 0;
+    catalog_build_opts();
+    os_items_add_row();
+    if (s_os_coletar_todos) { lv_obj_add_flag(s_os_items_section, LV_OBJ_FLAG_HIDDEN); }
 
     lv_obj_t *b_go = lv_btn_create(backdrop);
     lv_obj_set_width(b_go, lv_pct(100));
@@ -2365,7 +2844,6 @@ static void os_cancel_voltar_cb(lv_event_t *e)
         if (!s_os_paused) {
             led_vermelho_blink_stop();
         }
-        os_schedule_next_pick();
     }
 }
 
@@ -3000,8 +3478,6 @@ static void build_dashboard_into(lv_obj_t *scr)
     s_bar_os_meds       = NULL;
     s_lbl_os_eta        = NULL;
     s_lbl_os_eta_detail = NULL;
-    s_lbl_bomba_state   = NULL;
-    s_lbl_valvula_state = NULL;
 
     historico_close_modal();
     os_close_modal();
@@ -3566,6 +4042,8 @@ static void system_init(void)
              s_dev_robot_name, s_dev_robot_code,
              s_stepper_rpm, s_stepper_steps_rev,
              (unsigned)MICROSTEP_OPTIONS[s_stepper_ms_idx]);
+
+    catalog_load_builtin();
 
     /* 1. LDOs internos: alimentam o transmissor MIPI-DSI do P4. */
     esp_ldo_channel_config_t ldo3_cfg = { .chan_id = 3, .voltage_mv = 2500 };

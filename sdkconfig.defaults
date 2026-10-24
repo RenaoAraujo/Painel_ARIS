@@ -37,6 +37,9 @@ CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_COLOR_DEPTH=16
 CONFIG_LV_FONT_MONTSERRAT_24=y
 CONFIG_LV_FONT_MONTSERRAT_42=y
+# Heap do LVGL via malloc (PSRAM); o pool interno de 32 KB estoura com listas grandes.
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEM_CUSTOM_INCLUDE="stdlib.h"
 
 # --- FreeRTOS / task principal --------------------------------------------
 CONFIG_FREERTOS_HZ=100
